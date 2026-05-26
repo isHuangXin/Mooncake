@@ -448,10 +448,18 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path) {
+    // Note: enable_offload is NOT set from environment here.
+    // MOONCAKE_ENABLE_OFFLOAD controls the Master-side FileStorage offload
+    // service, not the client side.  Setting enable_offload=true on the
+    // client would start a local offload RPC server with port 0, causing
+    // "Connection refused" errors when the Master tries to call back.
+    // The io_uring configuration (MOONCAKE_USE_URING) is read by the Master
+    // process via its own environment.
     return to_py_ret(setup_internal(local_hostname, metadata_server,
                                     global_segment_size, local_buffer_size,
                                     protocol, rdma_devices, master_server_addr,
-                                    transfer_engine, ipc_socket_path));
+                                    transfer_engine, ipc_socket_path, 0,
+                                    false));
 }
 
 namespace {
@@ -544,7 +552,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     return setup_internal(local_hostname, metadata_server, global_segment_size,
                           local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path);
+                          master_server_addr, nullptr, ipc_socket_path, 0,
+                          false);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(

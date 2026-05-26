@@ -68,6 +68,10 @@ class SharedUringRing {
 
     // Register a buffer on THIS thread's ring.  Called lazily from each
     // thread before the first fixed-buffer I/O.
+    // Maximum size per iovec entry for io_uring_register_buffers.
+    // Kernel 5.15 pin_user_pages(FOLL_LONGTERM) fails for buffers > ~1 GB.
+    static constexpr size_t MAX_IOVEC_SIZE = 1024UL * 1024 * 1024;  // 1 GB
+
     bool ensure_buf_registered() {
         if (buf_registered_) return true;
         if (buf_register_failed_) return false;  // don't retry after failure
@@ -75,14 +79,25 @@ class SharedUringRing {
         void* b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
         if (!b || !s) return false;
-        struct iovec iov{b, s};
-        int ret = io_uring_register_buffers(&ring_, &iov, 1);
+
+        // Split the buffer into chunks of <= MAX_IOVEC_SIZE to work around
+        // kernel 5.15 pin_user_pages size limitation.
+        std::vector<struct iovec> iovs;
+        size_t offset = 0;
+        while (offset < s) {
+            size_t chunk = std::min(s - offset, MAX_IOVEC_SIZE);
+            iovs.push_back({static_cast<char*>(b) + offset, chunk});
+            offset += chunk;
+        }
+
+        int ret = io_uring_register_buffers(&ring_, iovs.data(),
+                                            static_cast<unsigned>(iovs.size()));
         if (ret < 0) {
             int err = -ret;
             LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers failed"
                          << " errno=" << err << " (" << strerror(err) << ")"
                          << " buf=" << b << " size=" << s
-                         << " pages=" << (s >> 12)
+                         << " chunks=" << iovs.size()
                          << " — falling back to non-fixed-buffer I/O";
             buf_register_failed_ = true;
             return false;
@@ -90,8 +105,9 @@ class SharedUringRing {
         buf_registered_ = true;
         buf_base_ = b;
         buf_size_ = s;
+        num_buf_chunks_ = iovs.size();
         LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
-                  << " size=" << s;
+                  << " size=" << s << " chunks=" << iovs.size();
         return true;
     }
 
@@ -158,7 +174,8 @@ class SharedUringRing {
                 }
                 const auto& d = descs[idx + i];
                 if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
+                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off,
+                                             buf_index_for(d.buf));
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
             }
@@ -222,6 +239,14 @@ class SharedUringRing {
         uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
         uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
         return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
+    }
+
+    // Compute the buf_index for io_uring fixed-buffer ops when the buffer
+    // was registered as multiple iovec chunks of MAX_IOVEC_SIZE.
+    int buf_index_for(const void* buf) const {
+        uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
+        uintptr_t base = reinterpret_cast<uintptr_t>(buf_base_);
+        return static_cast<int>((addr - base) / MAX_IOVEC_SIZE);
     }
 
     static size_t next_pow2(size_t n) {
@@ -298,12 +323,14 @@ class SharedUringRing {
 
                 if (is_write) {
                     if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
+                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur,
+                                                  buf_index_for(ptr));
                     else
                         io_uring_prep_write(sqe, fd, ptr, chunk, cur);
                 } else {
                     if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
+                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur,
+                                                 buf_index_for(ptr));
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
@@ -377,6 +404,7 @@ class SharedUringRing {
     bool buf_register_failed_ = false;  // set on first failure; skip retries
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
+    size_t num_buf_chunks_ = 0;
 };
 
 // ============================================================================
@@ -678,6 +706,24 @@ bool UringFile::register_global_buffer(void* buffer, size_t length) {
             << " failed errno=" << errno << " (" << strerror(errno)
             << ") — continuing anyway";
     }
+
+    // Pre-fault and lock all pages into physical memory before
+    // io_uring_register_buffers.  On kernel 5.15, the internal
+    // pin_user_pages(FOLL_LONGTERM) can return EFAULT (errno 14) if
+    // pages are not yet faulted in.  mlock() forces every page to be
+    // physically resident, eliminating the EFAULT.
+    if (mlock(buffer, length) != 0) {
+        LOG(WARNING)
+            << "[UringFile::register_global_buffer] mlock() failed"
+            << " errno=" << errno << " (" << strerror(errno)
+            << ") size=" << length
+            << " — io_uring_register_buffers may still fail";
+    } else {
+        LOG(INFO)
+            << "[UringFile::register_global_buffer] mlock() succeeded"
+            << " size=" << length << " (" << (length >> 20) << " MB)";
+    }
+
     g_buf.base.store(buffer, std::memory_order_release);
     g_buf.size.store(length, std::memory_order_release);
     bool ok = SharedUringRing::instance().ensure_buf_registered();

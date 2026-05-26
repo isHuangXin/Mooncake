@@ -33,17 +33,23 @@ AlignedClientBufferAllocator::create(size_t size, const std::string& protocol,
             return nullptr;
         }
     } else {
-        // Use posix_memalign for 4096-byte alignment
-        int ret =
-            posix_memalign(&aligned_buffer, kDirectIOAlignment, aligned_size);
-        if (ret != 0) {
-            LOG(ERROR) << "AlignedClientBufferAllocator: posix_memalign failed "
-                       << "with error " << ret << " (" << strerror(ret) << ")";
+        // Use mmap(MAP_SHARED | MAP_ANONYMOUS) instead of posix_memalign.
+        // Kernel 5.15 pin_user_pages(FOLL_LONGTERM) rejects long-term
+        // pinning of private anonymous pages (MAP_PRIVATE), which causes
+        // io_uring_register_buffers to fail with EFAULT.  MAP_SHARED
+        // anonymous mappings are backed by shmem and are allowed for
+        // long-term pinning.
+        aligned_buffer = mmap(nullptr, aligned_size,
+                              PROT_READ | PROT_WRITE,
+                              MAP_SHARED | MAP_ANONYMOUS,
+                              -1, 0);
+        if (aligned_buffer == MAP_FAILED) {
+            LOG(ERROR) << "AlignedClientBufferAllocator: mmap failed "
+                       << "errno=" << errno << " (" << strerror(errno) << ")";
+            aligned_buffer = nullptr;
             return nullptr;
         }
-
-        // Zero-initialize the allocated memory
-        memset(aligned_buffer, 0, aligned_size);
+        // mmap returns zeroed memory, no memset needed.
     }
 
     // Verify alignment
@@ -90,10 +96,10 @@ AlignedClientBufferAllocator::~AlignedClientBufferAllocator() {
                 << "at " << buffer_ << " (" << allocated_size_ << " bytes)";
             free_buffer_mmap_memory(buffer_, allocated_size_);
         } else {
-            LOG(INFO) << "AlignedClientBufferAllocator: freeing aligned memory "
+            LOG(INFO) << "AlignedClientBufferAllocator: freeing mmap memory "
                       << "at " << buffer_ << " (" << allocated_size_
                       << " bytes)";
-            free(buffer_);
+            munmap(buffer_, allocated_size_);
         }
         buffer_ = nullptr;
     }
