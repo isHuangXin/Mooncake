@@ -30,7 +30,8 @@ void FreeAlignedBuffer(void* buffer, size_t size, const std::string& protocol,
     } else if (UseProtocolAllocator(protocol)) {
         free_memory(protocol, buffer);
     } else {
-        free(buffer);
+        // FLAT_MEMORY: match the shared anonymous host mapping below.
+        munmap(buffer, size);
     }
 }
 
@@ -70,16 +71,15 @@ void* AllocateHugepageAlignedBuffer(size_t aligned_size) {
 }
 
 void* AllocatePosixAlignedBuffer(size_t aligned_size) {
-    void* aligned_buffer = nullptr;
-    int ret = posix_memalign(&aligned_buffer,
-                             AlignedClientBufferAllocator::kDirectIOAlignment,
-                             aligned_size);
-    if (ret != 0) {
-        LOG(ERROR) << "AlignedClientBufferAllocator: posix_memalign failed "
-                   << "with error " << ret << " (" << strerror(ret) << ")";
+    // FLAT_MEMORY: shared anonymous pages support long-term io_uring pinning
+    // on Kernel 5.15. Keep protocol-specific and hugepage allocators unchanged.
+    void* aligned_buffer = mmap(nullptr, aligned_size, PROT_READ | PROT_WRITE,
+                                MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (aligned_buffer == MAP_FAILED) {
+        LOG(ERROR) << "AlignedClientBufferAllocator: mmap failed "
+                   << "errno=" << errno << " (" << strerror(errno) << ")";
         return nullptr;
     }
-    memset(aligned_buffer, 0, aligned_size);
     return aligned_buffer;
 }
 
@@ -158,7 +158,7 @@ AlignedClientBufferAllocator::~AlignedClientBufferAllocator() {
             FreeAlignedBuffer(buffer_, allocated_size_, protocol_,
                               use_hugepage_);
         } else {
-            LOG(INFO) << "AlignedClientBufferAllocator: freeing aligned memory "
+            LOG(INFO) << "AlignedClientBufferAllocator: freeing mmap memory "
                       << "at " << buffer_ << " (" << allocated_size_
                       << " bytes)";
             FreeAlignedBuffer(buffer_, allocated_size_, protocol_,
