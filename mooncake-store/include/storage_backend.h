@@ -12,6 +12,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.hpp"
+#include "thread_pool.h"  // P5: for parallel BatchLoad reads
 #include "types.h"
 
 namespace mooncake {
@@ -981,6 +982,11 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Clear file cache (called on destruction or when needed)
     void ClearFileCache();
+
+    // P5: Thread pool for parallel BatchLoad reads (same as write parallelism)
+    // Threads are reused across reads, avoiding per-call thread creation/destruction
+    // which would cause expensive thread-local io_uring ring initialization (~150ms).
+    std::unique_ptr<ThreadPool> read_thread_pool_;
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {

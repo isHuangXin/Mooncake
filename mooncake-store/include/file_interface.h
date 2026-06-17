@@ -221,6 +221,26 @@ class UringFile : public StorageFile {
     };
     tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
 
+    // FLAT_MEMORY: Cross-fd batch read — submit up to QUEUE_DEPTH independent
+    // reads (each from a different fd) in one io_uring ring submission.
+    // Mirrors batch_write_multi_fd() but for reads.  Used by BatchLoad to
+    // submit reads across ALL bucket files in a single io_uring submission,
+    // maximising NVMe queue depth.
+    struct ReadDescMultiFd {
+        int fd;            ///< source file descriptor
+        void *buf;         ///< aligned destination buffer
+        size_t len;        ///< aligned read length
+        off_t off;         ///< file offset
+    };
+    static tl::expected<size_t, ErrorCode> batch_read_multi_fd(
+        const ReadDescMultiFd *descs, int cnt);
+
+    // P4: Async prefetch API — submit reads without blocking, collect later.
+    // This enables pipelining: while processing current batch, submit next batch.
+    static int submit_reads_async(const ReadDescMultiFd *descs, int cnt);
+    static tl::expected<size_t, ErrorCode> collect_pending_reads();
+    static int pending_read_count();
+
     // MOONCAKE_SSD_OPT: Cross-fd batch write — submit up to QUEUE_DEPTH
     // independent writes (each to a different fd) in one io_uring ring
     // submission. Used by FlushPreparedBuckets() to saturate NVMe queue depth.

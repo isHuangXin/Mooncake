@@ -46,7 +46,10 @@ static GlobalBufInfo g_buf;
 // ============================================================================
 class SharedUringRing {
    public:
-    static constexpr unsigned QUEUE_DEPTH = 32;
+    // P3: Increased from 32 → 500 for better NVMe queue utilization.
+    // NVMe SSDs have internal parallelism across NAND channels; higher QD
+    // allows more outstanding I/O commands, improving throughput.
+    static constexpr unsigned QUEUE_DEPTH = 500;
     static constexpr size_t MIN_CHUNK = 4096;
 
     static SharedUringRing& instance() {
@@ -188,6 +191,95 @@ class SharedUringRing {
         }
         return total;
     }
+
+    // FLAT_MEMORY: Cross-fd batch read — each entry targets a different fd.
+    struct ReadDescMultiFd {
+        int fd;
+        void* buf;
+        size_t len;
+        off_t off;
+    };
+
+    tl::expected<size_t, ErrorCode> batch_read_multi_fd(
+        const ReadDescMultiFd* descs, int cnt) {
+        ensure_buf_registered();
+        size_t total = 0;
+        int remaining = cnt;
+        int idx = 0;
+
+        while (remaining > 0) {
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR)
+                        << "[SharedUringRing] SQ full (batch_read_multi_fd)";
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                const auto& d = descs[idx + i];
+                if (buf_registered_ && in_registered_buf(d.buf, d.len))
+                    io_uring_prep_read_fixed(sqe, d.fd, d.buf, d.len, d.off,
+                                             buf_index_for(d.buf));
+                else
+                    io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
+            }
+
+            auto res = collect(batch);
+            if (!res) return res;
+            total += res.value();
+            idx += batch;
+            remaining -= batch;
+        }
+        return total;
+    }
+
+    // =========================================================================
+    // P4: Async prefetch API — submit reads without waiting, collect later.
+    // =========================================================================
+
+    /// Submit reads without blocking. Returns the number of submitted SQEs.
+    /// Call collect_pending() later to wait for completions.
+    int submit_reads_async(const ReadDescMultiFd* descs, int cnt) {
+        ensure_buf_registered();
+        int submitted = 0;
+
+        for (int i = 0; i < cnt && i < static_cast<int>(QUEUE_DEPTH); ++i) {
+            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+            if (!sqe) break;
+
+            const auto& d = descs[i];
+            if (buf_registered_ && in_registered_buf(d.buf, d.len))
+                io_uring_prep_read_fixed(sqe, d.fd, d.buf, d.len, d.off,
+                                         buf_index_for(d.buf));
+            else
+                io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
+            submitted++;
+        }
+
+        if (submitted > 0) {
+            int ret = io_uring_submit(&ring_);
+            if (ret < 0) {
+                LOG(ERROR) << "[SharedUringRing] submit_reads_async failed: "
+                           << strerror(-ret);
+                return 0;
+            }
+            pending_cqes_ += submitted;
+        }
+        return submitted;
+    }
+
+    /// Collect pending completions from previous async submits.
+    /// Returns total bytes read, or error.
+    tl::expected<size_t, ErrorCode> collect_pending() {
+        if (pending_cqes_ <= 0) return 0;
+        auto res = collect(pending_cqes_);
+        pending_cqes_ = 0;
+        return res;
+    }
+
+    /// Check how many pending completions are outstanding.
+    int pending_count() const { return pending_cqes_; }
 
     // MOONCAKE_SSD_OPT: Descriptor for one independently-addressed write in a
     // cross-fd batch.  Each entry targets a different file descriptor (different
@@ -445,6 +537,9 @@ class SharedUringRing {
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
     size_t num_buf_chunks_ = 0;
+
+    // P4: Track pending CQEs for async prefetch API
+    int pending_cqes_ = 0;
 };
 
 // ============================================================================
@@ -739,6 +834,45 @@ tl::expected<size_t, ErrorCode> UringFile::batch_write_multi_fd(
     const auto* ring_descs =
         reinterpret_cast<const SharedUringRing::WriteDesc*>(descs);
     return SharedUringRing::instance().batch_write(ring_descs, cnt);
+}
+
+// ---------------------------------------------------------------------------
+// FLAT_MEMORY: batch_read_multi_fd — cross-fd batch read via io_uring
+// ---------------------------------------------------------------------------
+
+tl::expected<size_t, ErrorCode> UringFile::batch_read_multi_fd(
+    const ReadDescMultiFd* descs, int cnt) {
+    if (!descs || cnt <= 0)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+
+    static_assert(sizeof(ReadDescMultiFd) ==
+                      sizeof(SharedUringRing::ReadDescMultiFd),
+                  "ReadDescMultiFd layout mismatch");
+    const auto* ring_descs =
+        reinterpret_cast<const SharedUringRing::ReadDescMultiFd*>(descs);
+    return SharedUringRing::instance().batch_read_multi_fd(ring_descs, cnt);
+}
+
+// ---------------------------------------------------------------------------
+// P4: Async prefetch API — submit reads without blocking, collect later
+// ---------------------------------------------------------------------------
+
+int UringFile::submit_reads_async(const ReadDescMultiFd* descs, int cnt) {
+    if (!descs || cnt <= 0) return 0;
+    static_assert(sizeof(ReadDescMultiFd) ==
+                      sizeof(SharedUringRing::ReadDescMultiFd),
+                  "ReadDescMultiFd layout mismatch");
+    const auto* ring_descs =
+        reinterpret_cast<const SharedUringRing::ReadDescMultiFd*>(descs);
+    return SharedUringRing::instance().submit_reads_async(ring_descs, cnt);
+}
+
+tl::expected<size_t, ErrorCode> UringFile::collect_pending_reads() {
+    return SharedUringRing::instance().collect_pending();
+}
+
+int UringFile::pending_read_count() {
+    return SharedUringRing::instance().pending_count();
 }
 
 // ---------------------------------------------------------------------------
