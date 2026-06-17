@@ -1,5 +1,7 @@
 #include "file_storage.h"
 
+#include <future>
+#include <iomanip>
 #include <memory>
 #include <vector>
 
@@ -264,6 +266,19 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     client_buffer_gc_running_.store(true);
     client_buffer_gc_thread_ =
         std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+
+    // MOONCAKE_SSD_OPT: Create dedicated thread pool for parallel bucket
+    // offload.  Threads are reused across eviction rounds, avoiding per-wave
+    // std::async thread creation/destruction overhead.
+    const int offload_parallelism =
+        GetEnvOr<int>("MOONCAKE_OFFLOAD_PARALLELISM", 8);
+    if (offload_parallelism > 1) {
+        offload_thread_pool_ =
+            std::make_unique<ThreadPool>(offload_parallelism);
+        LOG(INFO) << "[MOONCAKE_SSD_OPT] Offload thread pool created with "
+                  << offload_parallelism << " threads";
+    }
+
     return {};
 }
 
@@ -276,10 +291,61 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         return tl::make_unexpected(allocate_res.error());
     }
     auto allocated_batch = allocate_res.value();
+
+    // MOONCAKE_SSD_OPT: Measure pure SSD read bandwidth
+    auto read_start = std::chrono::steady_clock::now();
     auto result = BatchLoad(allocated_batch->slices);
+    auto read_elapsed_us = std::chrono::duration_cast<std::chrono::microseconds>(
+                               std::chrono::steady_clock::now() - read_start)
+                               .count();
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
         return tl::make_unexpected(result.error());
+    }
+
+    // FLAT_MEMORY: Log multi-perspective SSD read bandwidth
+    // ① batch (BatchLoad only), ② experiment-wide
+    {
+        size_t total_read_bytes = 0;
+        for (const auto& [key, slice] : allocated_batch->slices) {
+            total_read_bytes += slice.size;
+        }
+
+        // Update cumulative counters for experiment-wide tracking
+        auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t expected_ts = 0;
+        first_read_ts_us_.compare_exchange_strong(expected_ts, now_us);
+        cumulative_read_bytes_.fetch_add(total_read_bytes);
+
+        if (read_elapsed_us > 0 && total_read_bytes > 0) {
+            double read_bw_gbps =
+                static_cast<double>(total_read_bytes) /
+                (1024.0 * 1024.0 * 1024.0) /
+                (static_cast<double>(read_elapsed_us) / 1e6);
+            // ① batch: BatchLoad only
+            LOG(INFO) << "[MOONCAKE_SSD_OPT] SSD READ bandwidth:"
+                      << "\n  \xe2\x91\xa0 batch:      "
+                      << total_read_bytes / (1024 * 1024) << " MB in "
+                      << read_elapsed_us / 1000 << "ms = "
+                      << std::fixed << std::setprecision(2) << read_bw_gbps
+                      << " GB/s (BatchLoad, " << keys.size() << " keys)";
+            // ② experiment-wide
+            auto cum_bytes = cumulative_read_bytes_.load();
+            auto first_ts = first_read_ts_us_.load();
+            if (first_ts > 0) {
+                double wall_sec = static_cast<double>(now_us - first_ts) / 1e6;
+                if (wall_sec > 0.001) {
+                    double exp_bw = static_cast<double>(cum_bytes) /
+                                    (1024.0 * 1024.0 * 1024.0) / wall_sec;
+                    LOG(INFO) << "  \xe2\x91\xa1 exp-wide:   "
+                              << cum_bytes / (1024 * 1024) << " MB over "
+                              << std::fixed << std::setprecision(1) << wall_sec
+                              << "s = " << std::setprecision(2) << exp_bw
+                              << " GB/s (cumulative since first read)";
+                }
+            }
+        }
     }
 
     // After BatchLoad, slice.ptr may have been adjusted by offset_in_buffer
@@ -345,37 +411,267 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return ErrorCode::OK;
     };
 
-    for (const auto& keys : buckets_keys) {
-        std::unordered_map<std::string, std::vector<Slice>> batch_object;
-        auto query_result = BatchQuerySegmentSlices(keys, batch_object);
-        if (!query_result) {
-            LOG(ERROR) << "BatchQuerySlices failed with error: "
-                       << query_result.error();
-            continue;
+    // MOONCAKE_SSD_OPT: Three-phase bucket offload using ThreadPool + io_uring
+    // batch write.  Parallelism is configured via MOONCAKE_OFFLOAD_PARALLELISM
+    // env var (default 8) and thread pool is created in Init().
+    const size_t num_buckets = buckets_keys.size();
+
+    if (num_buckets <= 1 || !offload_thread_pool_) {
+        // Single bucket or parallelism disabled — use original serial path
+        for (const auto& keys : buckets_keys) {
+            std::unordered_map<std::string, std::vector<Slice>> batch_object;
+            auto query_result = BatchQuerySegmentSlices(keys, batch_object);
+            if (!query_result) {
+                LOG(ERROR) << "BatchQuerySlices failed with error: "
+                           << query_result.error();
+                continue;
+            }
+
+            auto eviction_handler = [this](const std::string& evicted_key) {
+                auto result =
+                    client_->EvictDiskReplica(evicted_key, ReplicaType::LOCAL_DISK);
+                if (!result) {
+                    LOG(WARNING)
+                        << "Failed to notify master about evicted local disk key: "
+                        << evicted_key << ", error: " << result.error();
+                }
+            };
+
+            auto offload_res = storage_backend_->BatchOffload(
+                batch_object, complete_handler, eviction_handler);
+            if (!offload_res) {
+                LOG(ERROR) << "Failed to store objects with error: "
+                           << offload_res.error();
+                if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                    MutexLocker locker(&offloading_mutex_);
+                    enable_offloading_ = false;
+                    return tl::make_unexpected(offload_res.error());
+                }
+                if (offload_res.error() != ErrorCode::INVALID_READ) {
+                    return tl::make_unexpected(offload_res.error());
+                }
+            }
+        }
+    } else {
+        // MOONCAKE_SSD_OPT: Three-phase pipeline using ThreadPool + io_uring
+        // batch write.
+        //
+        //  Phase 1 (ThreadPool, parallel): BuildBucket + PrepareWriteBucket
+        //    — CPU work: BatchQuerySegmentSlices, memcpy to aligned buffer,
+        //      open file, store metadata.  Each bucket is independent.
+        //
+        //  Phase 2 (single thread): io_uring batch_write
+        //    — Submit all bucket writes as SQEs in one batch, then reap all
+        //      CQEs at once.  Maximises NVMe device queue depth.
+        //
+        //  Phase 3 (ThreadPool, parallel): complete_handler + metadata commit
+        //    — Notify master of offload success and commit to metadata maps.
+        //
+        auto bucket_backend =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+
+        LOG(INFO) << "[MOONCAKE_SSD_OPT] Three-phase offload: "
+                  << num_buckets << " buckets, pool_threads="
+                  << (offload_thread_pool_ ? "yes" : "no");
+        auto offload_start = std::chrono::steady_clock::now();
+
+        // ---- Phase 1: Parallel Prepare ----
+        std::vector<std::future<
+            tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>>>
+            prepare_futures;
+        prepare_futures.reserve(num_buckets);
+
+        std::atomic<bool> keys_ultra_limit{false};
+
+        for (size_t i = 0; i < num_buckets && !keys_ultra_limit; ++i) {
+            const auto& keys = buckets_keys[i];
+            prepare_futures.push_back(offload_thread_pool_->submit(
+                [this, &keys, &keys_ultra_limit, &bucket_backend]()
+                    -> tl::expected<BucketStorageBackend::PreparedBucket,
+                                    ErrorCode> {
+                    // Query segment slices (CPU, read-only on DRAM)
+                    std::unordered_map<std::string, std::vector<Slice>>
+                        batch_object;
+                    auto query_result =
+                        BatchQuerySegmentSlices(keys, batch_object);
+                    if (!query_result) {
+                        LOG(ERROR)
+                            << "Phase1: BatchQuerySlices failed: "
+                            << query_result.error();
+                        return tl::make_unexpected(query_result.error());
+                    }
+
+                    // PrepareBatchOffload: BuildBucket + PrepareWriteBucket
+                    auto prepare_res =
+                        bucket_backend->PrepareBatchOffload(batch_object);
+                    if (!prepare_res &&
+                        prepare_res.error() ==
+                            ErrorCode::KEYS_ULTRA_LIMIT) {
+                        keys_ultra_limit.store(true,
+                                               std::memory_order_relaxed);
+                    }
+                    return prepare_res;
+                }));
         }
 
-        auto eviction_handler = [this](const std::string& evicted_key) {
-            auto result =
-                client_->EvictDiskReplica(evicted_key, ReplicaType::LOCAL_DISK);
-            if (!result) {
-                LOG(WARNING)
-                    << "Failed to notify master about evicted local disk key: "
-                    << evicted_key << ", error: " << result.error();
-            }
-        };
+        // Collect Phase 1 results
+        std::vector<BucketStorageBackend::PreparedBucket> prepared;
+        prepared.reserve(num_buckets);
+        bool phase1_fatal = false;
 
-        auto offload_res = storage_backend_->BatchOffload(
-            batch_object, complete_handler, eviction_handler);
-        if (!offload_res) {
-            LOG(ERROR) << "Failed to store objects with error: "
-                       << offload_res.error();
-            if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
-                MutexLocker locker(&offloading_mutex_);
-                enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
+        for (auto& fut : prepare_futures) {
+            auto res = fut.get();
+            if (!res) {
+                LOG(ERROR) << "Phase1: bucket prepare failed: " << res.error();
+                if (res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                    MutexLocker locker(&offloading_mutex_);
+                    enable_offloading_ = false;
+                    phase1_fatal = true;
+                    break;
+                }
+                continue;  // skip this bucket, proceed with others
             }
-            if (offload_res.error() != ErrorCode::INVALID_READ) {
-                return tl::make_unexpected(offload_res.error());
+            prepared.push_back(std::move(res.value()));
+        }
+
+        if (phase1_fatal) {
+            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+        }
+
+        if (prepared.empty()) {
+            LOG(WARNING) << "[MOONCAKE_SSD_OPT] No buckets prepared, skipping "
+                            "Phase 2/3";
+            return {};
+        }
+
+        auto phase1_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - offload_start)
+                .count();
+
+        // ---- Phase 2: io_uring batch write ----
+        auto phase2_start = std::chrono::steady_clock::now();
+
+        if (bucket_backend) {
+            auto flush_res = bucket_backend->FlushPreparedBuckets(prepared);
+            if (!flush_res) {
+                LOG(ERROR) << "Phase2: FlushPreparedBuckets failed: "
+                           << flush_res.error();
+                return tl::make_unexpected(flush_res.error());
+            }
+        }
+
+        auto phase2_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - phase2_start)
+                .count();
+
+        // ---- Phase 3: Parallel Finalize (complete_handler + metadata) ----
+        auto phase3_start = std::chrono::steady_clock::now();
+
+        std::vector<std::future<tl::expected<int64_t, ErrorCode>>>
+            finalize_futures;
+        finalize_futures.reserve(prepared.size());
+
+        for (auto& p : prepared) {
+            finalize_futures.push_back(offload_thread_pool_->submit(
+                [&complete_handler, &bucket_backend,
+                 bucket_id = p.bucket_id,
+                 metadata = std::move(p.metadata),
+                 metadatas = std::move(p.metadatas)]() mutable
+                    -> tl::expected<int64_t, ErrorCode> {
+                    // Notify master of offload success
+                    auto error_code =
+                        complete_handler(metadata->keys, metadatas);
+                    if (error_code != ErrorCode::OK) {
+                        LOG(ERROR)
+                            << "Phase3: complete_handler failed, id="
+                            << bucket_id;
+                        return tl::make_unexpected(error_code);
+                    }
+
+                    // Commit metadata to in-memory maps
+                    return bucket_backend->CommitBucket(
+                        bucket_id, std::move(metadata), metadatas);
+                }));
+        }
+
+        // Collect Phase 3 results
+        for (auto& fut : finalize_futures) {
+            auto res = fut.get();
+            if (!res) {
+                LOG(ERROR) << "Phase3: finalize failed: " << res.error();
+                if (res.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
+                    // non-fatal for duplicates, fatal for others
+                }
+            }
+        }
+
+        auto total_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - offload_start)
+                .count();
+        auto phase3_elapsed =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - phase3_start)
+                .count();
+        LOG(INFO) << "[MOONCAKE_SSD_OPT] Three-phase offload completed: "
+                  << prepared.size() << "/" << num_buckets << " buckets in "
+                  << total_elapsed << "ms (P1=" << phase1_elapsed
+                  << "ms, P2=" << phase2_elapsed
+                  << "ms, P3=" << phase3_elapsed << "ms)";
+
+        // FLAT_MEMORY: Log multi-perspective SSD write bandwidth
+        // ① burst (Phase 2 only), ② end-to-end (P1+P2+P3), ③ experiment-wide
+        size_t total_write_bytes = 0;
+        for (const auto& p : prepared) total_write_bytes += p.aligned_size;
+
+        // Update cumulative counters for experiment-wide tracking
+        auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        int64_t expected_ts = 0;
+        first_write_ts_us_.compare_exchange_strong(expected_ts, now_us);
+        cumulative_write_bytes_.fetch_add(total_write_bytes);
+
+        if (total_write_bytes > 0) {
+            auto to_gbps = [](size_t bytes, double ms) -> double {
+                return static_cast<double>(bytes) /
+                       (1024.0 * 1024.0 * 1024.0) / (ms / 1000.0);
+            };
+            size_t mb = total_write_bytes / (1024 * 1024);
+
+            // ① burst: Phase 2 only (pure io_uring)
+            if (phase2_elapsed > 0) {
+                LOG(INFO) << "[MOONCAKE_SSD_OPT] SSD WRITE bandwidth:"
+                          << "\n  \xe2\x91\xa0 burst:      " << mb << " MB in "
+                          << phase2_elapsed << "ms = "
+                          << std::fixed << std::setprecision(2)
+                          << to_gbps(total_write_bytes, phase2_elapsed)
+                          << " GB/s (io_uring batch_write, "
+                          << prepared.size() << " SQEs)";
+            }
+            // ② end-to-end: P1+P2+P3
+            if (total_elapsed > 0) {
+                LOG(INFO) << "  \xe2\x91\xa1 end-to-end: " << mb << " MB in "
+                          << total_elapsed << "ms = "
+                          << std::fixed << std::setprecision(2)
+                          << to_gbps(total_write_bytes, total_elapsed)
+                          << " GB/s (P1+P2+P3 pipeline)";
+            }
+            // ③ experiment-wide
+            auto cum_bytes = cumulative_write_bytes_.load();
+            auto first_ts = first_write_ts_us_.load();
+            if (first_ts > 0) {
+                double wall_sec = static_cast<double>(now_us - first_ts) / 1e6;
+                if (wall_sec > 0.001) {
+                    double exp_bw = static_cast<double>(cum_bytes) /
+                                    (1024.0 * 1024.0 * 1024.0) / wall_sec;
+                    LOG(INFO) << "  \xe2\x91\xa2 exp-wide:   "
+                              << cum_bytes / (1024 * 1024) << " MB over "
+                              << std::fixed << std::setprecision(1) << wall_sec
+                              << "s = " << std::setprecision(2) << exp_bw
+                              << " GB/s (cumulative since first write)";
+                }
             }
         }
     }

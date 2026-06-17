@@ -448,13 +448,6 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path) {
-    // Note: enable_offload is NOT set from environment here.
-    // MOONCAKE_ENABLE_OFFLOAD controls the Master-side FileStorage offload
-    // service, not the client side.  Setting enable_offload=true on the
-    // client would start a local offload RPC server with port 0, causing
-    // "Connection refused" errors when the Master tries to call back.
-    // The io_uring configuration (MOONCAKE_USE_URING) is read by the Master
-    // process via its own environment.
     return to_py_ret(setup_internal(local_hostname, metadata_server,
                                     global_segment_size, local_buffer_size,
                                     protocol, rdma_devices, master_server_addr,
@@ -2734,6 +2727,8 @@ RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
     std::unordered_map<std::string, Slice> &objects) {
     auto start_time = std::chrono::steady_clock::now();
+
+    // RPC path: request the target node's RPC server to read from SSD
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     for (const auto &object_it : objects) {

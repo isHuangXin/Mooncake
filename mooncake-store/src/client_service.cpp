@@ -2091,8 +2091,21 @@ void Client::PutToLocalFile(const std::string& key,
 
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
+        // FLAT_MEMORY: time the synchronous StoreObject (file->write) on the
+        // legacy root_fs_dir persistence path and feed the aggregating SSD
+        // write-bandwidth meter. The value buffer size is the on-SSD byte count
+        // for this object.
+        const uint64_t store_bytes = value.size();
+        const auto store_begin = std::chrono::steady_clock::now();
         // Store the object
         auto store_result = backend->StoreObject(path, value, key);
+        if (store_result) {
+            const auto store_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - store_begin)
+                    .count();
+            ssd_write_bw_meter_.Record(store_bytes, store_us);
+        }
         ReplicaType replica_type = ReplicaType::DISK;
 
         if (!store_result) {

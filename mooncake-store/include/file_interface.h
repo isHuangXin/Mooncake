@@ -149,6 +149,10 @@ class StorageFile {
      */
     ErrorCode get_error_code() { return error_code_; }
 
+    // MOONCAKE_SSD_OPT: Expose the underlying file descriptor for
+    // cross-fd io_uring batch operations (batch_write).
+    int fd() const { return fd_; }
+
    protected:
     std::string filename_;
     int fd_;
@@ -216,6 +220,18 @@ class UringFile : public StorageFile {
         off_t off;
     };
     tl::expected<size_t, ErrorCode> batch_read(const ReadDesc *descs, int cnt);
+
+    // MOONCAKE_SSD_OPT: Cross-fd batch write — submit up to QUEUE_DEPTH
+    // independent writes (each to a different fd) in one io_uring ring
+    // submission. Used by FlushPreparedBuckets() to saturate NVMe queue depth.
+    struct WriteDesc {
+        int fd;            ///< target file descriptor
+        const void *buf;   ///< aligned source buffer
+        size_t len;        ///< aligned write length
+        off_t off;         ///< file offset (typically 0)
+    };
+    static tl::expected<size_t, ErrorCode> batch_write_multi_fd(
+        const WriteDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

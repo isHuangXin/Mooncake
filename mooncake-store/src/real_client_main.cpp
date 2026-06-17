@@ -86,10 +86,14 @@ int main(int argc, char *argv[]) {
         return -1;
     }
 
-    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, "127.0.0.1");
+    // FLAT_MEMORY: Bind to FLAGS_host instead of 127.0.0.1 so that remote
+    // clients (SGLang thin client) can reach the RPC server at the advertised
+    // transport_endpoint (e.g., 192.168.100.1:50052).
+    coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, FLAGS_host);
     RegisterClientRpcService(server, *client_inst);
 
-    LOG(INFO) << "Starting real client service on 127.0.0.1:" << FLAGS_port;
+    LOG(INFO) << "Starting real client service on " << FLAGS_host << ":"
+               << FLAGS_port;
 
     return server.start();
 }

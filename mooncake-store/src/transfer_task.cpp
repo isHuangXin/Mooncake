@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include "transfer_engine.h"
 #include "transport/transport.h"
@@ -94,9 +95,18 @@ void FilereadWorkerPool::workerThread() {
                     continue;
                 }
 
+                // FLAT_MEMORY: time the synchronous LoadObject (file->read) on
+                // the legacy root_fs_dir read-back path and feed the
+                // aggregating SSD read-bandwidth meter.
+                const auto read_begin = std::chrono::steady_clock::now();
                 auto load_result = backend_->LoadObject(
                     task.file_path, task.slices, task.object_size);
                 if (load_result) {
+                    const auto read_us =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - read_begin)
+                            .count();
+                    ssd_read_bw_meter_.Record(task.object_size, read_us);
                     VLOG(2) << "Fileread task completed successfully with "
                             << task.file_path;
                     task.state->set_completed(ErrorCode::OK);

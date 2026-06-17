@@ -136,6 +136,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
             global_file_segment_size_);
     }
 
+    // FLAT_MEMORY: Also set SSD capacity for offload mode (without root_fs_dir)
+    // so that the "SSD Storage" metric shows a valid denominator.
+    if (enable_offload_ && root_fs_dir_.empty()) {
+        MasterMetricManager::instance().inc_total_file_capacity(
+            global_file_segment_size_);
+    }
+
     if (enable_snapshot_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             snapshot_running_ = true;

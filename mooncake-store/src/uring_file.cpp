@@ -189,6 +189,46 @@ class SharedUringRing {
         return total;
     }
 
+    // MOONCAKE_SSD_OPT: Descriptor for one independently-addressed write in a
+    // cross-fd batch.  Each entry targets a different file descriptor (different
+    // bucket file), enabling NVMe device queue depth > 1 from a single thread.
+    struct WriteDesc {
+        int fd;
+        const void* buf;
+        size_t len;
+        off_t off;
+    };
+
+    /// Submit up to QUEUE_DEPTH independent writes at once (each to its own
+    /// fd), then collect completions.  Mirrors batch_read() but writes to
+    /// different file descriptors instead of different offsets within one fd.
+    tl::expected<size_t, ErrorCode> batch_write(const WriteDesc* descs, int cnt) {
+        size_t total = 0;
+        int remaining = cnt;
+        int idx = 0;
+
+        while (remaining > 0) {
+            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_write)";
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                const auto& d = descs[idx + i];
+                io_uring_prep_write(sqe, d.fd, d.buf, d.len, d.off);
+            }
+
+            auto res = collect(batch);
+            if (!res) return res;
+            total += res.value();
+            idx += batch;
+            remaining -= batch;
+        }
+        return total;
+    }
+
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
         if (!initialized_)
@@ -682,6 +722,23 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
         return make_error<void>(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: batch_write_multi_fd — cross-fd batch write via io_uring
+// ---------------------------------------------------------------------------
+
+tl::expected<size_t, ErrorCode> UringFile::batch_write_multi_fd(
+    const WriteDesc* descs, int cnt) {
+    if (!descs || cnt <= 0)
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+    // Map UringFile::WriteDesc → SharedUringRing::WriteDesc (same layout).
+    static_assert(sizeof(WriteDesc) == sizeof(SharedUringRing::WriteDesc),
+                  "WriteDesc layout mismatch");
+    const auto* ring_descs =
+        reinterpret_cast<const SharedUringRing::WriteDesc*>(descs);
+    return SharedUringRing::instance().batch_write(ring_descs, cnt);
 }
 
 // ---------------------------------------------------------------------------

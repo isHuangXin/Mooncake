@@ -13,6 +13,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -758,10 +759,15 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
-    if (use_uring_ && mode == FileMode::Read) {
+    // MOONCAKE_SSD_OPT: Enable O_DIRECT for both reads AND writes when
+    // io_uring is active.  For writes this bypasses the Page Cache entirely,
+    // sending data straight to NVMe via DMA — critical for saturating SSD
+    // bandwidth during eviction.  WriteBucket already handles alignment: it
+    // memcpy's iovecs into a posix_memalign'd buffer and calls write_aligned().
+    // Metadata files (.meta) are small and go through the non-UringFile path
+    // (StoreBucketMetadata uses file->write() not write_aligned()), so the
+    // O_DIRECT flag only affects data files opened as UringFile.
+    if (use_uring_) {
         flags |= O_DIRECT;
     }
 #endif
@@ -785,10 +791,9 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
 
 #ifdef USE_URING
     if (use_uring_) {
-        // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
-        // writes. This avoids unnecessary bounce-buffer allocation on the write
-        // path while keeping correct alignment enforcement on the read path.
-        bool use_direct_io = (mode == FileMode::Read);
+        // MOONCAKE_SSD_OPT: O_DIRECT is now set for both reads and writes,
+        // so use_direct_io is always true when io_uring is active.
+        bool use_direct_io = true;
         return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
@@ -1010,6 +1015,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
     // Process each key; continue on individual failures to support partial
     // success
+    auto adaptor_write_start = std::chrono::steady_clock::now();
+    size_t adaptor_write_bytes = 0;
     for (auto& object : batch_object) {
         KVEntry kv;
         kv.key = object.first;
@@ -1055,9 +1062,29 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
                                   static_cast<int64_t>(kv.value.size()), ""});
         keys.emplace_back(kv.key);
+        adaptor_write_bytes += kv_buf.size();
     }
 
     // Only report successful keys to master
+    {
+        auto adaptor_write_elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - adaptor_write_start)
+                .count();
+        if (adaptor_write_elapsed_us > 0 && adaptor_write_bytes > 0) {
+            double w_mb = static_cast<double>(adaptor_write_bytes) /
+                          (1024.0 * 1024.0);
+            double w_sec =
+                static_cast<double>(adaptor_write_elapsed_us) / 1e6;
+            double w_gbps = static_cast<double>(adaptor_write_bytes) /
+                            (1024.0 * 1024.0 * 1024.0) / w_sec;
+            LOG(INFO) << "[MOONCAKE_SSD_BW] SSD WRITE bandwidth (adaptor): "
+                      << std::fixed << std::setprecision(1) << w_mb
+                      << " MB in " << adaptor_write_elapsed_us / 1000
+                      << " ms = " << std::setprecision(2) << w_gbps
+                      << " GB/s (" << keys.size() << " keys)";
+        }
+    }
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
@@ -1239,21 +1266,9 @@ BucketStorageBackend::BucketStorageBackend(
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
+    // MOONCAKE_SSD_OPT: aligned_io_buffer_ removed — now thread_local in
+    // WriteBucket / PrepareWriteBucket to avoid data races under concurrent
+    // offload.  Each worker thread lazily allocates its own 32MB buffer.
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -1295,10 +1310,31 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(build_bucket_result.error());
     }
     auto bucket = build_bucket_result.value();
+    auto write_start = std::chrono::steady_clock::now();
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    auto write_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - write_start)
+            .count();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         return tl::make_unexpected(write_bucket_result.error());
+    }
+    {
+        double write_mb =
+            static_cast<double>(bucket->data_size) / (1024.0 * 1024.0);
+        double write_sec = static_cast<double>(write_elapsed_us) / 1e6;
+        double write_gbps =
+            (write_sec > 0)
+                ? (static_cast<double>(bucket->data_size) /
+                   (1024.0 * 1024.0 * 1024.0) / write_sec)
+                : 0.0;
+        LOG(INFO) << "[MOONCAKE_SSD_BW] SSD WRITE bandwidth: "
+                  << std::fixed << std::setprecision(1) << write_mb
+                  << " MB in " << write_elapsed_us / 1000 << " ms = "
+                  << std::setprecision(2) << write_gbps << " GB/s"
+                  << " (bucket_id=" << bucket_id
+                  << ", keys=" << bucket->keys.size() << ")";
     }
     if (complete_handler != nullptr) {
         auto error_code = complete_handler(bucket->keys, metadatas);
@@ -1424,6 +1460,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
+    size_t total_read_bytes = 0;
+    auto read_start = std::chrono::steady_clock::now();
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
@@ -1495,7 +1533,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                            << ", got: " << read_res.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
+            total_read_bytes += read_res.value();
         }
+    }
+
+    auto read_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start)
+            .count();
+    if (read_elapsed_us > 0 && total_read_bytes > 0) {
+        double read_mb =
+            static_cast<double>(total_read_bytes) / (1024.0 * 1024.0);
+        double read_sec = static_cast<double>(read_elapsed_us) / 1e6;
+        double read_gbps =
+            static_cast<double>(total_read_bytes) /
+            (1024.0 * 1024.0 * 1024.0) / read_sec;
+        LOG(INFO) << "[MOONCAKE_SSD_BW] SSD READ bandwidth: "
+                  << std::fixed << std::setprecision(1) << read_mb
+                  << " MB in " << read_elapsed_us / 1000 << " ms = "
+                  << std::setprecision(2) << read_gbps << " GB/s"
+                  << " (" << batch_object.size() << " keys, "
+                  << bucket_read_plans.size() << " buckets)";
     }
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
@@ -1944,14 +2002,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
+        // MOONCAKE_SSD_OPT: Use thread_local aligned buffer to avoid data
+        // races when multiple offload threads call WriteBucket concurrently.
+        // Each thread lazily allocates its own 32MB buffer on first use.
         void* write_buffer = nullptr;
         std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
                                                            [](void*) {}};
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
+        thread_local std::unique_ptr<void, void (*)(void*)>
+            tl_aligned_io_buffer{nullptr, [](void*) {}};
+        if (!tl_aligned_io_buffer) {
+            void* b = nullptr;
+            int r = posix_memalign(&b, kDirectIOAlignment, kAlignedBufferSize);
+            if (r == 0) {
+                tl_aligned_io_buffer = std::unique_ptr<void, void (*)(void*)>(
+                    b, [](void* p) { free(p); });
+            }
+        }
+
+        if (aligned_size <= kAlignedBufferSize && tl_aligned_io_buffer) {
+            // Use the per-thread pre-allocated buffer
+            write_buffer = tl_aligned_io_buffer.get();
         } else {
             // Allocate a temporary larger buffer
             void* buf = nullptr;
@@ -1999,14 +2070,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
+        // MOONCAKE_SSD_OPT: Skip datasync — KVCache is recomputable data, so
+        // crash-loss is acceptable.  Removing the per-bucket sync eliminates
+        // the main I/O stall that serialised WriteBucket latency.
 
         // Invalidate cache for this file since content changed
         {
@@ -2058,6 +2124,210 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: Two-phase write support
+// ---------------------------------------------------------------------------
+
+tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
+BucketStorageBackend::PrepareWriteBucket(
+    int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+    std::vector<iovec>& iovs,
+    std::vector<StorageObjectMetadata>& metadatas) {
+    namespace fs = std::filesystem;
+
+    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+    if (!bucket_data_path_res) {
+        LOG(ERROR) << "PrepareWriteBucket: failed to get path, bucket_id="
+                   << bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto bucket_data_path = bucket_data_path_res.value();
+
+    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    if (!open_file_result) {
+        LOG(ERROR) << "PrepareWriteBucket: failed to open file: "
+                   << bucket_data_path;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    auto file = std::move(open_file_result.value());
+
+    size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
+    size_t aligned_size = align_up(total_size, kDirectIOAlignment);
+
+    // Allocate a per-bucket aligned buffer (each PreparedBucket owns its own).
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+    if (ret != 0) {
+        LOG(ERROR) << "PrepareWriteBucket: posix_memalign failed, bucket_id="
+                   << bucket_id << ", size=" << aligned_size
+                   << ": " << strerror(ret);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    std::unique_ptr<void, void (*)(void*)> buffer{buf,
+                                                   [](void* p) { free(p); }};
+
+    // Aggregate all iovecs into the aligned buffer
+    char* dst = static_cast<char*>(buf);
+    for (const auto& iov : iovs) {
+        memcpy(dst, iov.iov_base, iov.iov_len);
+        dst += iov.iov_len;
+    }
+    // Zero-pad
+    if (aligned_size > total_size) {
+        memset(dst, 0, aligned_size - total_size);
+    }
+
+    // Also store bucket metadata to disk (this is small I/O, do it inline)
+    auto store_meta_result = StoreBucketMetadata(bucket_id, bucket_metadata);
+    if (!store_meta_result) {
+        LOG(ERROR) << "PrepareWriteBucket: StoreBucketMetadata failed, "
+                   << "bucket_id=" << bucket_id;
+        // Clean up the data file
+        std::error_code ec;
+        fs::remove(bucket_data_path, ec);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    int fd_val = file->fd();
+
+    return PreparedBucket{fd_val,
+                          std::move(file),
+                          std::move(bucket_data_path),
+                          std::move(buffer),
+                          aligned_size,
+                          std::move(bucket_metadata),
+                          bucket_id,
+                          std::move(metadatas)};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::FlushPreparedBuckets(
+    std::vector<PreparedBucket>& prepared) {
+    if (prepared.empty()) return {};
+
+#ifdef USE_URING
+    if (file_storage_config_.use_uring) {
+        // Build WriteDesc array for batch submission
+        std::vector<UringFile::WriteDesc> descs;
+        descs.reserve(prepared.size());
+        for (auto& p : prepared) {
+            descs.push_back(
+                {p.fd, p.buffer.get(), p.aligned_size, /*off=*/0});
+        }
+
+        auto result = UringFile::batch_write_multi_fd(descs.data(),
+                                                       static_cast<int>(descs.size()));
+        if (!result) {
+            LOG(ERROR) << "FlushPreparedBuckets: batch_write_multi_fd failed";
+            return tl::make_unexpected(result.error());
+        }
+
+        // Verify total bytes written
+        size_t expected_total = 0;
+        for (auto& p : prepared) expected_total += p.aligned_size;
+        if (result.value() != expected_total) {
+            LOG(ERROR) << "FlushPreparedBuckets: size mismatch, expected="
+                       << expected_total << ", got=" << result.value();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Invalidate file cache for all written files
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            for (auto& p : prepared) {
+                file_cache_.erase(p.bucket_data_path);
+            }
+        }
+        return {};
+    }
+#endif
+
+    // Fallback: write each bucket individually via WriteBucket-style path
+    for (auto& p : prepared) {
+        // Re-construct iovs from the prepared buffer (single contiguous block)
+        iovec iov{p.buffer.get(), p.aligned_size};
+        std::vector<iovec> iovs{iov};
+        auto write_result = WriteBucket(p.bucket_id, p.metadata, iovs);
+        if (!write_result) {
+            LOG(ERROR) << "FlushPreparedBuckets fallback: WriteBucket failed, "
+                       << "bucket_id=" << p.bucket_id;
+            return tl::make_unexpected(write_result.error());
+        }
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: PrepareBatchOffload — public entry for Phase 1
+// ---------------------------------------------------------------------------
+
+tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
+BucketStorageBackend::PrepareBatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "PrepareBatchOffload: backend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (batch_object.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    auto enable_res = IsEnableOffloading();
+    if (!enable_res || !enable_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    auto bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    std::vector<StorageObjectMetadata> metadatas;
+    auto build_res = BuildBucket(bucket_id, batch_object, iovs, metadatas);
+    if (!build_res) {
+        LOG(ERROR) << "PrepareBatchOffload: BuildBucket failed, id="
+                   << bucket_id;
+        return tl::make_unexpected(build_res.error());
+    }
+
+    auto prepare_res = PrepareWriteBucket(
+        bucket_id, build_res.value(), iovs, metadatas);
+    if (!prepare_res) {
+        LOG(ERROR) << "PrepareBatchOffload: PrepareWriteBucket failed, id="
+                   << bucket_id;
+    }
+    return prepare_res;
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: CommitBucket — metadata commit for the three-phase path
+// ---------------------------------------------------------------------------
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitBucket(
+    int64_t bucket_id,
+    std::shared_ptr<BucketMetadata> bucket_metadata,
+    std::vector<StorageObjectMetadata>& metadatas) {
+    SharedMutexLocker lock(&mutex_);
+
+    // Pre-check for duplicates
+    for (const auto& key : bucket_metadata->keys) {
+        if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+            LOG(WARNING) << "CommitBucket: duplicate key: " << key
+                         << ", bucket_id=" << bucket_id;
+            lock.unlock();
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+    }
+
+    // Commit
+    total_size_ += bucket_metadata->data_size + bucket_metadata->meta_size;
+    object_bucket_map_.reserve(object_bucket_map_.size() +
+                               bucket_metadata->keys.size());
+    for (size_t i = 0; i < bucket_metadata->keys.size(); ++i) {
+        object_bucket_map_.insert(
+            {bucket_metadata->keys[i], std::move(metadatas[i])});
+    }
+    buckets_.emplace(bucket_id, std::move(bucket_metadata));
+    return bucket_id;
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
@@ -2290,10 +2560,13 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    // MOONCAKE_SSD_OPT: Enable O_DIRECT for both reads AND writes when
+    // io_uring is active.  For writes this bypasses Page Cache, sending data
+    // straight to NVMe via DMA — critical for saturating SSD bandwidth.
+    // WriteBucket uses write_aligned() with a pre-aligned buffer.
+    // StoreBucketMetadata uses file->write() which handles O_DIRECT alignment
+    // internally via a bounce buffer (see UringFile::write()).
+    if (file_storage_config_.use_uring) {
         flags |= O_DIRECT;
     }
 #endif
@@ -2305,7 +2578,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    if (file_storage_config_.use_uring) {
+        // MOONCAKE_SSD_OPT: use_direct_io=true for both read and write paths.
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif

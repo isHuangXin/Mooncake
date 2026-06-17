@@ -785,6 +785,41 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     size_t UngroupedOffloadingObjectsSize() const;
 
+    // MOONCAKE_SSD_OPT: Commit a prepared bucket's metadata to the in-memory
+    // maps.  Called by FileStorage::OffloadObjects Phase 3 after batch I/O.
+    tl::expected<int64_t, ErrorCode> CommitBucket(
+        int64_t bucket_id,
+        std::shared_ptr<BucketMetadata> bucket_metadata,
+        std::vector<StorageObjectMetadata>& metadatas);
+
+    // MOONCAKE_SSD_OPT: Two-phase write — PrepareWriteBucket does CPU work
+    // (OpenFile + memcpy to aligned buffer) and FlushPreparedBuckets submits
+    // all writes to io_uring in one batch, maximising NVMe queue depth.
+
+    /// Result of the prepare phase for one bucket — holds the open fd, the
+    /// aligned write buffer, and metadata needed for the flush + finalize
+    /// phases.
+    struct PreparedBucket {
+        int fd;
+        std::unique_ptr<StorageFile> file;           // keeps fd alive
+        std::string bucket_data_path;
+        std::unique_ptr<void, void (*)(void*)> buffer;
+        size_t aligned_size;
+        std::shared_ptr<BucketMetadata> metadata;
+        int64_t bucket_id;
+        std::vector<StorageObjectMetadata> metadatas; // per-object metadata
+    };
+
+    // Prepare a single batch_object for the two-phase write pipeline.
+    // Combines BuildBucket + PrepareWriteBucket into one public call.
+    tl::expected<PreparedBucket, ErrorCode> PrepareBatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object);
+
+    /// Phase 2 (I/O, single thread): submit all prepared writes via io_uring
+    /// batch_write, then invalidate file cache.
+    tl::expected<void, ErrorCode> FlushPreparedBuckets(
+        std::vector<PreparedBucket>& prepared);
+
     /**
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
@@ -839,6 +874,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
+
+    /// Phase 1 (CPU, parallelisable): open file, memcpy iovecs → aligned buf.
+    tl::expected<PreparedBucket, ErrorCode> PrepareWriteBucket(
+        int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
+        std::vector<iovec>& iovs,
+        std::vector<StorageObjectMetadata>& metadatas);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -902,10 +943,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
     // Aligned buffer for O_DIRECT I/O operations
-    // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
+    // MOONCAKE_SSD_OPT: Buffer is now thread_local inside WriteBucket /
+    // PrepareWriteBucket to avoid data races under concurrent offload.
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 32MB
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *

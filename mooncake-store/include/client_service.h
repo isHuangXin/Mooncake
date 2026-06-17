@@ -15,6 +15,7 @@
 #include "client_metric.h"
 #include "ha_helper.h"
 #include "master_client.h"
+#include "ssd_bw_meter.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
@@ -609,6 +610,12 @@ class Client {
     // Client persistent thread pool for async operations
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
+
+    // FLAT_MEMORY: aggregated SSD write-bandwidth meter for the legacy
+    // root_fs_dir persistence path (Client::PutToLocalFile -> StoreObject).
+    // Shared by all write_thread_pool_ workers; flushes a "[MOONCAKE_SSD_BW]"
+    // line periodically instead of once per (millions of) objects.
+    SsdBwMeter ssd_write_bw_meter_{"WRITE (legacy)"};
 
     // For high availability
     MasterViewHelper master_view_helper_;

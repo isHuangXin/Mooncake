@@ -8,6 +8,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <atomic>
+#include <future>
 namespace mooncake {
 /**
  * @class ThreadPool
@@ -34,6 +35,13 @@ class ThreadPool {
      */
     template <class F, class... Args>
     void enqueue(F&& f, Args&&... args);
+
+    // MOONCAKE_SSD_OPT: submit() returns std::future so the caller can wait
+    // for task completion and retrieve the result. Used by OffloadObjects()
+    // to dispatch parallel bucket prepare work and collect results.
+    template <class F, class... Args>
+    auto submit(F&& f, Args&&... args)
+        -> std::future<std::invoke_result_t<F, Args...>>;
 
     /// Stops the thread pool (waits for current tasks to complete)
     void stop();
@@ -66,5 +74,30 @@ void ThreadPool::enqueue(F&& f, Args&&... args) {
         tasks.emplace([task] { (*task)(); });
     }
     condition.notify_one();  ///< Wake one waiting worker
+}
+
+/**
+ * @brief Submits a task and returns a std::future for its result.
+ * @details Unlike enqueue(), the caller can wait on the returned future to
+ *          retrieve the task's return value. Used by OffloadObjects() to
+ *          dispatch parallel CPU work (BuildBucket + PrepareWriteBucket) and
+ *          collect results before the io_uring batch-write phase.
+ */
+template <class F, class... Args>
+auto ThreadPool::submit(F&& f, Args&&... args)
+    -> std::future<std::invoke_result_t<F, Args...>> {
+    using return_type = std::invoke_result_t<F, Args...>;
+    auto task = std::make_shared<std::packaged_task<return_type()>>(
+        std::bind(std::forward<F>(f), std::forward<Args>(args)...));
+    std::future<return_type> result = task->get_future();
+    {
+        std::unique_lock<std::mutex> lock(queue_mutex);
+        if (stop_flag) {
+            throw std::runtime_error("submit on stopped ThreadPool");
+        }
+        tasks.emplace([task]() { (*task)(); });
+    }
+    condition.notify_one();
+    return result;
 }
 }  // namespace mooncake

@@ -168,13 +168,25 @@ class Replica {
             std::string transport_endpoint, ReplicaStatus status)
         : data_(LocalDiskReplicaData{client_id, object_size,
                                      std::move(transport_endpoint)}),
-          status_(status) {}
+          status_(status) {
+        // FLAT_MEMORY: Track SSD storage usage for offloaded data (same as
+        // DiskReplicaData constructor above).  Without this, the master's
+        // "SSD Storage" metric always shows 0 for the offload path.
+        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+    }
 
     ~Replica() {
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
             MasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
+        }
+        // FLAT_MEMORY: Also track LocalDiskReplicaData (offload path)
+        if (status_ != ReplicaStatus::UNDEFINED && is_local_disk_replica()) {
+            const auto& local_disk_data =
+                std::get<LocalDiskReplicaData>(data_);
+            MasterMetricManager::instance().dec_allocated_file_size(
+                local_disk_data.object_size);
         }
     }
 
@@ -204,6 +216,13 @@ class Replica {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
             MasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
+        }
+        // FLAT_MEMORY: Also for LocalDiskReplicaData (offload path)
+        if (status_ != ReplicaStatus::UNDEFINED && is_local_disk_replica()) {
+            const auto& local_disk_data =
+                std::get<LocalDiskReplicaData>(data_);
+            MasterMetricManager::instance().dec_allocated_file_size(
+                local_disk_data.object_size);
         }
 
         id_ = src.id_;

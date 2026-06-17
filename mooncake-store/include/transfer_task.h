@@ -17,6 +17,7 @@
 #include "types.h"
 #include "replica.h"
 #include "storage_backend.h"
+#include "ssd_bw_meter.h"
 #include "client_metric.h"
 
 namespace mooncake {
@@ -353,6 +354,12 @@ class FilereadWorkerPool {
     std::condition_variable queue_cv_;
     std::atomic<bool> shutdown_;
     std::shared_ptr<StorageBackend> backend_;
+
+    // FLAT_MEMORY: aggregated SSD read-bandwidth meter for the legacy
+    // root_fs_dir read-back path (workerThread -> StorageBackend::LoadObject).
+    // Shared by all fileread workers; flushes a "[MOONCAKE_SSD_BW]" line
+    // periodically instead of once per object.
+    SsdBwMeter ssd_read_bw_meter_{"READ (legacy)"};
 };
 
 /**
