@@ -17,6 +17,7 @@
 #include "client_metric.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
+#include "ssd_bw_meter.h"
 #include "storage_backend.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
@@ -949,6 +950,11 @@ class Client {
     const std::string metadata_connstring_;
     const std::string protocol_;
     const bool object_checksum_enabled_;
+
+    // FLAT_MEMORY: aggregated SSD write-bandwidth meter for the legacy
+    // root_fs_dir persistence path (Client::PutToLocalFile -> StoreObject).
+    // Shared by all write_thread_pool_ workers and must outlive the pool.
+    SsdBwMeter ssd_write_bw_meter_{"WRITE (legacy)"};
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive

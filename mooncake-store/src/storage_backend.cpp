@@ -19,6 +19,7 @@
 #include <vector>
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
@@ -1459,6 +1460,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
 
     // Process each key; continue on individual failures to support partial
     // success
+    auto adaptor_write_start = std::chrono::steady_clock::now();
+    size_t adaptor_write_bytes = 0;
     for (auto& object : batch_object) {
         KVEntry kv;
         kv.key = object.first;
@@ -1498,9 +1501,29 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
                                   static_cast<int64_t>(kv.value.size()), ""});
         keys.emplace_back(kv.key);
+        adaptor_write_bytes += kv_buf.size();
     }
 
     // Only report successful keys to master
+    {
+        auto adaptor_write_elapsed_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - adaptor_write_start)
+                .count();
+        if (adaptor_write_elapsed_us > 0 && adaptor_write_bytes > 0) {
+            double w_mb = static_cast<double>(adaptor_write_bytes) /
+                          (1024.0 * 1024.0);
+            double w_sec =
+                static_cast<double>(adaptor_write_elapsed_us) / 1e6;
+            double w_gbps = static_cast<double>(adaptor_write_bytes) /
+                            (1024.0 * 1024.0 * 1024.0) / w_sec;
+            LOG(INFO) << "[MOONCAKE_SSD_BW] SSD WRITE bandwidth (adaptor): "
+                      << std::fixed << std::setprecision(1) << w_mb
+                      << " MB in " << adaptor_write_elapsed_us / 1000
+                      << " ms = " << std::setprecision(2) << w_gbps
+                      << " GB/s (" << keys.size() << " keys)";
+        }
+    }
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
@@ -1709,21 +1732,8 @@ BucketStorageBackend::BucketStorageBackend(
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
-    // Allocate aligned buffer for O_DIRECT I/O operations
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
-    if (ret != 0) {
-        LOG(ERROR)
-            << "BucketStorageBackend: Failed to allocate aligned buffer: "
-            << strerror(ret);
-    } else {
-        aligned_io_buffer_.reset(buf);
-        // Update the deleter to use free
-        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
-            buf, [](void* p) { free(p); });
-        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
-                  << " bytes aligned buffer at " << buf;
-    }
+    // MOONCAKE_SSD_OPT: WriteBucket uses a thread_local 32MB buffer;
+    // PrepareWriteBucket keeps a separate buffer per pending bucket.
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -1795,11 +1805,33 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
             << finalize_result.error();
     }
 
+    auto write_start = std::chrono::steady_clock::now();
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
+    auto write_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - write_start)
+            .count();
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
         ReleasePreparedWrite(pending);
+        CleanupOrphanedBucket(bucket_id);
         return tl::make_unexpected(write_bucket_result.error());
+    }
+    {
+        double write_mb =
+            static_cast<double>(bucket->data_size) / (1024.0 * 1024.0);
+        double write_sec = static_cast<double>(write_elapsed_us) / 1e6;
+        double write_gbps =
+            (write_sec > 0)
+                ? (static_cast<double>(bucket->data_size) /
+                   (1024.0 * 1024.0 * 1024.0) / write_sec)
+                : 0.0;
+        LOG(INFO) << "[MOONCAKE_SSD_BW] SSD WRITE bandwidth: "
+                  << std::fixed << std::setprecision(1) << write_mb
+                  << " MB in " << write_elapsed_us / 1000 << " ms = "
+                  << std::setprecision(2) << write_gbps << " GB/s"
+                  << " (bucket_id=" << bucket_id
+                  << ", keys=" << bucket->keys.size() << ")";
     }
     VLOG(1) << "Written bucket with id: " << bucket_id;
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
@@ -1972,6 +2004,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
+    size_t total_read_bytes = 0;
+    auto read_start = std::chrono::steady_clock::now();
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
@@ -2060,6 +2094,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 batch_object.at(plan.key).ptr =
                     static_cast<char*>(plan.dest_slice.ptr) +
                     batch_plan.offset_in_buffer;
+                total_read_bytes += desc.bytes_read;
             }
             continue;
         }
@@ -2081,7 +2116,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                            << ", got: " << read_result.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
+            total_read_bytes += read_result.value();
         }
+    }
+
+    auto read_elapsed_us =
+        std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - read_start)
+            .count();
+    if (read_elapsed_us > 0 && total_read_bytes > 0) {
+        double read_mb =
+            static_cast<double>(total_read_bytes) / (1024.0 * 1024.0);
+        double read_sec = static_cast<double>(read_elapsed_us) / 1e6;
+        double read_gbps =
+            static_cast<double>(total_read_bytes) /
+            (1024.0 * 1024.0 * 1024.0) / read_sec;
+        LOG(INFO) << "[MOONCAKE_SSD_BW] SSD READ bandwidth: "
+                  << std::fixed << std::setprecision(1) << read_mb
+                  << " MB in " << read_elapsed_us / 1000 << " ms = "
+                  << std::setprecision(2) << read_gbps << " GB/s"
+                  << " (" << batch_object.size() << " keys, "
+                  << bucket_read_plans.size() << " buckets)";
     }
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
@@ -2607,14 +2662,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // Allocate aligned buffer if needed
+        // MOONCAKE_SSD_OPT: Use thread_local aligned buffer to avoid data
+        // races when multiple offload threads call WriteBucket concurrently.
+        // Each thread lazily allocates its own 32MB buffer on first use.
         void* write_buffer = nullptr;
         std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
                                                            [](void*) {}};
 
-        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
-            // Use the pre-allocated buffer
-            write_buffer = aligned_io_buffer_.get();
+        thread_local std::unique_ptr<void, void (*)(void*)>
+            tl_aligned_io_buffer{nullptr, [](void*) {}};
+        if (!tl_aligned_io_buffer) {
+            void* b = nullptr;
+            int r = posix_memalign(&b, kDirectIOAlignment, kAlignedBufferSize);
+            if (r == 0) {
+                tl_aligned_io_buffer = std::unique_ptr<void, void (*)(void*)>(
+                    b, [](void* p) { free(p); });
+            }
+        }
+
+        if (aligned_size <= kAlignedBufferSize && tl_aligned_io_buffer) {
+            // Use the per-thread pre-allocated buffer
+            write_buffer = tl_aligned_io_buffer.get();
         } else {
             // Allocate a temporary larger buffer
             void* buf = nullptr;
@@ -2662,15 +2730,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);
@@ -2700,6 +2759,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             file_cache_.erase(bucket_data_path);
         }
     }
+    // FLAT_MEMORY: preserve data-before-metadata durability for both I/O paths.
+    auto sync_result = file->datasync();
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -2721,6 +2786,283 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: Two-phase write support
+// ---------------------------------------------------------------------------
+
+// FLAT_MEMORY: one movable owner for reservation and per-bucket rollback.
+void BucketStorageBackend::PreparedBucket::Cleanup::operator()(
+    PendingEviction* pending) const {
+    backend->ReleasePreparedWrite(*pending);
+    if (committed) {
+        backend->RollbackCommittedBucket(bucket_id, pending->write_keys);
+    } else {
+        backend->CleanupOrphanedBucket(bucket_id);
+    }
+    delete pending;
+}
+
+tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
+BucketStorageBackend::PrepareWriteBucket(
+    PreparedBucket prepared, const std::vector<iovec>& iovs) {
+    auto bucket_data_path_res = GetBucketDataPath(prepared.bucket_id);
+    if (!bucket_data_path_res) {
+        LOG(ERROR) << "PrepareWriteBucket: failed to get path, bucket_id="
+                   << prepared.bucket_id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    prepared.bucket_data_path = std::move(bucket_data_path_res.value());
+
+    auto open_file_result = OpenFile(prepared.bucket_data_path, FileMode::Write);
+    if (!open_file_result) {
+        LOG(ERROR) << "PrepareWriteBucket: failed to open file: "
+                   << prepared.bucket_data_path;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    prepared.file = std::move(open_file_result.value());
+    prepared.fd = prepared.file->fd();
+
+    size_t total_size = static_cast<size_t>(prepared.metadata->data_size);
+    prepared.aligned_size = align_up(total_size, kDirectIOAlignment);
+
+    // Each prepared bucket owns its buffer until the batch I/O completes.
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, prepared.aligned_size);
+    if (ret != 0) {
+        LOG(ERROR) << "PrepareWriteBucket: posix_memalign failed, bucket_id="
+                   << prepared.bucket_id << ", size=" << prepared.aligned_size
+                   << ": " << strerror(ret);
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    prepared.buffer = std::unique_ptr<void, void (*)(void*)>(
+        buf, [](void* p) { free(p); });
+
+    char* dst = static_cast<char*>(buf);
+    for (const auto& iov : iovs) {
+        memcpy(dst, iov.iov_base, iov.iov_len);
+        dst += iov.iov_len;
+    }
+    if (prepared.aligned_size > total_size) {
+        memset(dst, 0, prepared.aligned_size - total_size);
+    }
+
+    // Metadata is persisted only after data has been written and synced.
+    return prepared;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::FlushPreparedBuckets(
+    std::vector<PreparedBucket>& prepared) {
+    if (prepared.empty()) return {};
+
+    // FLAT_MEMORY: abort the batch without discarding metadata needed for NACK.
+    auto fail = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
+        for (auto& p : prepared) {
+            p.file.reset();
+            p.pending_.reset();
+        }
+        return tl::make_unexpected(error);
+    };
+    for (const auto& p : prepared) {
+        if (!p.pending_ || p.flushed_ || !p.file || !p.buffer) {
+            return fail(ErrorCode::INVALID_PARAMS);
+        }
+    }
+
+#ifdef USE_URING
+    if (file_storage_config_.use_uring) {
+        std::vector<UringFile::WriteDesc> descs;
+        descs.reserve(prepared.size());
+        size_t expected_total = 0;
+        for (auto& p : prepared) {
+            descs.push_back({p.fd, p.buffer.get(), p.aligned_size, /*off=*/0});
+            expected_total += p.aligned_size;
+        }
+
+        auto result = UringFile::batch_write_multi_fd(
+            descs.data(), static_cast<int>(descs.size()));
+        if (!result) {
+            LOG(ERROR) << "FlushPreparedBuckets: batch_write_multi_fd failed";
+            return fail(result.error());
+        }
+        if (result.value() != expected_total) {
+            LOG(ERROR) << "FlushPreparedBuckets: size mismatch, expected="
+                       << expected_total << ", got=" << result.value();
+            return fail(ErrorCode::FILE_WRITE_FAIL);
+        }
+    } else
+#endif
+    {
+        // POSIX writes need the logical size, not the O_DIRECT padding.
+        for (auto& p : prepared) {
+            iovec iov{p.buffer.get(), static_cast<size_t>(p.metadata->data_size)};
+            auto result = p.file->vector_write(&iov, 1, 0);
+            if (!result) {
+                return fail(result.error());
+            }
+            if (result.value() != iov.iov_len) {
+                return fail(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+    }
+
+    for (auto& p : prepared) {
+        auto sync_result = p.file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "FlushPreparedBuckets: datasync failed, bucket_id="
+                       << p.bucket_id;
+            return fail(sync_result.error());
+        }
+        auto meta_result = StoreBucketMetadata(p.bucket_id, p.metadata);
+        if (!meta_result) {
+            return fail(meta_result.error());
+        }
+    }
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        for (auto& p : prepared) {
+            file_cache_.erase(p.bucket_data_path);
+            p.flushed_ = true;
+        }
+    }
+    return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: PrepareBatchOffload — public entry for Phase 1
+// ---------------------------------------------------------------------------
+
+tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
+BucketStorageBackend::PrepareBatchOffload(
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+    EvictionHandler eviction_handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "PrepareBatchOffload: backend not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (batch_object.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_KEY);
+    }
+
+    auto enable_res = IsEnableOffloading();
+    if (!enable_res) {
+        return tl::make_unexpected(enable_res.error());
+    }
+    if (!enable_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+
+    PreparedBucket prepared;
+    prepared.bucket_id = bucket_id_generator_->NextId();
+    std::vector<iovec> iovs;
+    auto build_res = BuildBucket(prepared.bucket_id, batch_object, iovs,
+                                 prepared.metadatas);
+    if (!build_res) {
+        LOG(ERROR) << "PrepareBatchOffload: BuildBucket failed, id="
+                   << prepared.bucket_id;
+        return tl::make_unexpected(build_res.error());
+    }
+    prepared.metadata = std::move(build_res.value());
+
+    // FLAT_MEMORY: use upstream reservations before opening/writing files.
+    auto pending = std::make_unique<PendingEviction>();
+    auto eviction_result = PrepareEviction(
+        prepared.metadata->data_size + prepared.metadata->meta_size,
+        prepared.metadata->keys);
+    if (!eviction_result) {
+        return tl::make_unexpected(eviction_result.error());
+    }
+    *pending = std::move(eviction_result.value());
+    if (eviction_handler && !pending->keys.empty()) {
+        auto notify_result = eviction_handler(pending->keys);
+        if (!notify_result) {
+            RestorePreparedEviction(std::move(*pending));
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+    CommitPreparedEviction(*pending);
+    prepared.pending_ = decltype(prepared.pending_)(
+        pending.release(),
+        PreparedBucket::Cleanup{this, prepared.bucket_id, false});
+
+    auto finalize_result = FinalizeEviction(*prepared.pending_);
+    if (!finalize_result) {
+        LOG(ERROR) << "FinalizeEviction failed after master committed eviction; "
+                      "continuing PrepareBatchOffload: "
+                   << finalize_result.error();
+    }
+    return PrepareWriteBucket(std::move(prepared), iovs);
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: CommitBucket — metadata commit for the three-phase path
+// ---------------------------------------------------------------------------
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitBucket(
+    PreparedBucket& prepared,
+    std::function<ErrorCode(const std::vector<std::string>& keys,
+                            std::vector<StorageObjectMetadata>& metadatas)>
+        complete_handler) {
+    if (!prepared.pending_ || !prepared.flushed_) {
+        prepared.file.reset();
+        prepared.pending_.reset();
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const auto bucket_id = prepared.bucket_id;
+    const auto& bucket_metadata = prepared.metadata;
+    const auto& keys = bucket_metadata->keys;
+    {
+        SharedMutexLocker lock(&mutex_);
+        ReleasePreparedWriteLocked(*prepared.pending_);
+        prepared.pending_->write_size = 0;
+
+        for (const auto& key : keys) {
+            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+                LOG(WARNING) << "CommitBucket: duplicate key: " << key
+                             << ", bucket_id=" << bucket_id;
+                lock.unlock();
+                prepared.file.reset();
+                prepared.pending_.reset();
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
+
+        total_size_ += bucket_metadata->data_size + bucket_metadata->meta_size;
+        object_bucket_map_.reserve(object_bucket_map_.size() + keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            auto [it, inserted] =
+                object_bucket_map_.insert({keys[i], prepared.metadatas[i]});
+            CHECK(inserted) << "Reserved key became duplicated: " << keys[i];
+        }
+        auto ts = 0LL;
+        if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU) {
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket_metadata->last_access_ns_.store(ts,
+                                                   std::memory_order_relaxed);
+        }
+        buckets_.emplace(bucket_id, bucket_metadata);
+        lru_index_.emplace(ts, bucket_id);
+        prepared.pending_.get_deleter().committed = true;
+    }
+
+    // FLAT_MEMORY: reads must find the local index before master notification.
+    if (complete_handler) {
+        auto error_code = complete_handler(keys, prepared.metadatas);
+        if (error_code != ErrorCode::OK) {
+            LOG(ERROR) << "Complete handler failed: " << error_code
+                       << ", Key count: " << keys.size()
+                       << ", Bucket id: " << bucket_id;
+            prepared.file.reset();
+            // The RAII deleter uses the upstream RollbackCommittedBucket,
+            // including waiting for bucket read guards before deleting files.
+            prepared.pending_.reset();
+            return tl::make_unexpected(error_code);
+        }
+    }
+    // Reservation was released under lock; disarm successful-write rollback.
+    delete prepared.pending_.release();
+    return bucket_id;
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
@@ -3579,10 +3921,13 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // Use O_DIRECT only for reads: write latency is not sensitive in this
-    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
-    // corrupts meta file parsing and wastes disk space on data files.
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    // MOONCAKE_SSD_OPT: bucket data writes bypass Page Cache via O_DIRECT.
+    // FLAT_MEMORY: keep metadata writes buffered to avoid padding protobufs.
+    const bool use_uring =
+        file_storage_config_.use_uring &&
+        (mode == FileMode::Read ||
+         std::filesystem::path(path).extension() == BUCKET_DATA_FILE_SUFFIX);
+    if (use_uring) {
         flags |= O_DIRECT;
     }
 #endif
@@ -3594,7 +3939,7 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
 #ifdef USE_URING
-    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+    if (use_uring) {
         return std::make_unique<UringFile>(path, fd, 32, true);
     }
 #endif

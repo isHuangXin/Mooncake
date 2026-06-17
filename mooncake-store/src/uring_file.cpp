@@ -207,6 +207,69 @@ class SharedUringRing {
         return {};
     }
 
+    // MOONCAKE_SSD_OPT: Descriptor for one independently-addressed write in a
+    // cross-fd batch.  Each entry targets a different file descriptor (different
+    // bucket file), enabling NVMe device queue depth > 1 from a single thread.
+    using WriteDesc = UringFile::WriteDesc;
+
+    /// Submit up to QUEUE_DEPTH independent writes at once (each to its own
+    /// fd), then collect completions.  Mirrors batch_read() but writes to
+    /// different file descriptors instead of different offsets within one fd.
+    tl::expected<size_t, ErrorCode> batch_write(const WriteDesc* descs, int cnt) {
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        size_t total = 0;
+        int remaining = cnt;
+        int idx = 0;
+
+        while (remaining > 0) {
+            // FLAT_MEMORY: retain v0.3.13's large-I/O splitting and CQE tags.
+            if (descs[idx].len > max_rw_count()) {
+                const auto& d = descs[idx];
+                auto res = write(d.fd, d.buf, d.len, d.off);
+                if (!res || res.value() != d.len)
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                total += res.value();
+                ++idx;
+                --remaining;
+                continue;
+            }
+            int batch = 0;
+            while (batch < remaining && batch < static_cast<int>(QUEUE_DEPTH) &&
+                   descs[idx + batch].len <= max_rw_count()) {
+                ++batch;
+            }
+            if (io_uring_sq_space_left(&ring_) < static_cast<unsigned>(batch))
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            uint64_t op = next_operation_tag();
+            std::vector<ReadDesc> completions(batch);
+
+            for (int i = 0; i < batch; ++i) {
+                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
+                if (!sqe) {
+                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_write)";
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                }
+                const auto& d = descs[idx + i];
+                io_uring_prep_write(sqe, d.fd, d.buf, d.len, d.off);
+                sqe->user_data = op | static_cast<uint64_t>(i + 1);
+            }
+
+            auto res = collect_batch(batch, op, completions.data());
+            if (!res)
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            for (int i = 0; i < batch; ++i) {
+                if (!completions[i].completed ||
+                    completions[i].bytes_read != descs[idx + i].len)
+                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+                total += completions[i].bytes_read;
+            }
+            idx += batch;
+            remaining -= batch;
+        }
+        return total;
+    }
+
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
     tl::expected<void, ErrorCode> fsync(int fd) {
         if (!initialized_)
@@ -880,6 +943,18 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
+}
+
+// ---------------------------------------------------------------------------
+// MOONCAKE_SSD_OPT: batch_write_multi_fd — cross-fd batch write via io_uring
+// ---------------------------------------------------------------------------
+
+tl::expected<size_t, ErrorCode> UringFile::batch_write_multi_fd(
+    const WriteDesc* descs, int cnt) {
+    if (!descs || cnt <= 0)
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+    return SharedUringRing::instance().batch_write(descs, cnt);
 }
 
 // ---------------------------------------------------------------------------

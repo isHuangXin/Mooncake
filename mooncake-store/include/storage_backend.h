@@ -870,6 +870,8 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 };
 
 class BucketStorageBackend : public StorageBackendInterface {
+    struct PendingEviction;
+
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
                          const BucketBackendConfig& bucket_backend_config_);
@@ -978,6 +980,52 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     size_t UngroupedOffloadingObjectsSize() const;
 
+    // MOONCAKE_SSD_OPT: Two-phase write — PrepareWriteBucket does CPU work
+    // (OpenFile + memcpy to aligned buffer) and FlushPreparedBuckets submits
+    // all writes to io_uring in one batch, maximising NVMe queue depth.
+
+    /// Owns one bucket's write resources until commit; the backend must outlive
+    /// it. FLAT_MEMORY: failed or abandoned writes release their reservation
+    /// and clean up only this bucket, including safe rollback after local commit.
+    struct PreparedBucket {
+        int fd = -1;
+        std::unique_ptr<StorageFile> file;  // keeps fd alive
+        std::string bucket_data_path;
+        std::unique_ptr<void, void (*)(void*)> buffer{nullptr, [](void*) {}};
+        size_t aligned_size = 0;
+        std::shared_ptr<BucketMetadata> metadata;
+        int64_t bucket_id = 0;
+        std::vector<StorageObjectMetadata> metadatas;  // per-object metadata
+
+       private:
+        friend class BucketStorageBackend;
+        struct Cleanup {
+            BucketStorageBackend* backend;
+            int64_t bucket_id;
+            bool committed;
+            void operator()(PendingEviction* pending) const;
+        };
+        std::unique_ptr<PendingEviction, Cleanup> pending_{
+            nullptr, Cleanup{nullptr, 0, false}};
+        bool flushed_ = false;
+    };
+
+    // Commit the local index before notifying the master in Phase 3.
+    tl::expected<int64_t, ErrorCode> CommitBucket(
+        PreparedBucket& prepared,
+        std::function<ErrorCode(const std::vector<std::string>& keys,
+                                std::vector<StorageObjectMetadata>& metadatas)>
+            complete_handler);
+
+    // Reserve space and notify eviction before preparing the new bucket.
+    tl::expected<PreparedBucket, ErrorCode> PrepareBatchOffload(
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
+        EvictionHandler eviction_handler = nullptr);
+
+    /// Phase 2: submit writes, datasync data, then persist bucket metadata.
+    tl::expected<void, ErrorCode> FlushPreparedBuckets(
+        std::vector<PreparedBucket>& prepared);
+
     /**
      * @brief Iterate over the metadata of stored objects starting from a
      * specified bucket.
@@ -1036,6 +1084,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> WriteBucket(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
         std::vector<iovec>& iovs);
+
+    /// Phase 1 (CPU, parallelisable): open file, memcpy iovecs → aligned buf.
+    tl::expected<PreparedBucket, ErrorCode> PrepareWriteBucket(
+        PreparedBucket prepared, const std::vector<iovec>& iovs);
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -1192,10 +1244,9 @@ class BucketStorageBackend : public StorageBackendInterface {
     static constexpr const char* BUCKET_METADATA_FILE_SUFFIX = ".meta";
 
     // Aligned buffer for O_DIRECT I/O operations
-    // We use a fixed-size buffer to avoid frequent allocations
-    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 16MB
-    std::unique_ptr<void, void (*)(void*)> aligned_io_buffer_{nullptr,
-                                                              [](void*) {}};
+    // MOONCAKE_SSD_OPT: WriteBucket's buffer is thread_local to avoid data
+    // races under concurrent offload; prepared buckets own separate buffers.
+    static constexpr size_t kAlignedBufferSize = 32 * 1024 * 1024;  // 32MB
     /**
      * @brief A shared mutex to protect concurrent access to metadata.
      *

@@ -6819,6 +6819,8 @@ RealClient::batch_get_into_offload_object_internal(
     const OffloadReadRange *read_range) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
+
+    // RPC path: request the target node's RPC server to read from SSD
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;

@@ -4199,6 +4199,9 @@ void Client::PutToLocalFile(const std::string& key,
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
+        // FLAT_MEMORY: time the existing legacy StoreObject persistence path.
+        const uint64_t store_bytes = value.size();
+        const auto store_begin = std::chrono::steady_clock::now();
         ReplicaType replica_type = ReplicaType::DISK;
         // Store the object
         auto store_result = backend->StoreObject(
@@ -4237,6 +4240,13 @@ void Client::PutToLocalFile(const std::string& key,
             }
             return;
         }
+
+        // FLAT_MEMORY: record only successful persistence operations.
+        const auto store_us =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - store_begin)
+                .count();
+        ssd_write_bw_meter_.Record(store_bytes, store_us);
 
         // If storage succeeded, end the put operation
         auto end_result =
