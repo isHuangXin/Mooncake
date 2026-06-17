@@ -21,6 +21,7 @@
 #include <chrono>
 #include <iomanip>
 #include <unordered_set>
+#include <future>  // P5: for thread-pool read results
 
 #include <ylt/struct_pb.hpp>
 
@@ -2004,17 +2005,304 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
+    // FLAT_MEMORY: Multi-level optimization for SSD read bandwidth:
+    //   P1: GetOrOpenFile() — reuse cached fd, avoid open()/close() per call
+    //   P2: batch_read_multi_fd() — submit reads across buckets in one io_uring submission
+    //   P3: QUEUE_DEPTH increased from 32 → 500 for better NVMe utilization
+    //   P5: Multi-threaded parallel reads using pre-created ThreadPool (8 threads)
+    //       - Thread pool reuses threads across calls (avoids io_uring ring init ~150ms)
+    //       - Each thread handles a subset of buckets with batch_read_multi_fd
+    //
+    // Previously: per-key read_aligned() with QD=1 → ~0.26 GB/s
+    // After P0:   per-bucket batch_read() with QD=32 → ~2-3 GB/s
+    // After P1+P2+P3: cross-bucket batch_read_multi_fd() with QD=500 → ~2-3 GB/s
+    // After P5: multi-thread + batch_read_multi_fd → target ~4-6 GB/s
     size_t total_read_bytes = 0;
     auto read_start = std::chrono::steady_clock::now();
+
+#ifdef USE_URING
+    // P5: Parallel reads using pre-created thread pool
+    // Each thread handles a subset of buckets with batch_read_multi_fd
+    if (file_storage_config_.use_uring && read_thread_pool_ &&
+        bucket_read_plans.size() > 1) {
+        // Partition buckets across threads
+        std::vector<std::pair<int64_t, std::vector<ReadPlan>*>> bucket_list;
+        bucket_list.reserve(bucket_read_plans.size());
+        for (auto& [bucket_id, plans] : bucket_read_plans) {
+            bucket_list.emplace_back(bucket_id, &plans);
+        }
+
+        // Track per-key alignment info for post-processing (thread-safe via per-thread vectors)
+        struct ThreadResult {
+            std::vector<std::string> keys;
+            std::vector<void*> adjusted_ptrs;
+            std::vector<size_t> data_sizes;
+            size_t bytes_read = 0;
+            ErrorCode error = ErrorCode::OK;
+        };
+
+        const size_t num_threads = std::min(bucket_list.size(), static_cast<size_t>(8));
+        std::vector<std::future<ThreadResult>> futures;
+        futures.reserve(num_threads);
+
+        // Distribute buckets across threads
+        bool any_error = false;
+        ErrorCode first_error = ErrorCode::OK;
+        size_t buckets_per_thread = (bucket_list.size() + num_threads - 1) / num_threads;
+
+        for (size_t t = 0; t < num_threads; ++t) {
+            size_t start_idx = t * buckets_per_thread;
+            size_t end_idx = std::min(start_idx + buckets_per_thread, bucket_list.size());
+            if (start_idx >= bucket_list.size()) break;
+
+            // Capture range of buckets for this thread
+            try {
+                futures.push_back(read_thread_pool_->submit(
+                    [this, &bucket_list, start_idx, end_idx]() -> ThreadResult {
+                        ThreadResult result;
+
+                        std::vector<UringFile::ReadDescMultiFd> descs;
+                        std::vector<std::string> keys;
+                        std::vector<size_t> data_sizes;
+                        std::vector<int64_t> offsets_in_buffer;
+                        // Keep files alive until the batch completes.
+                        std::vector<std::shared_ptr<StorageFile>> files;
+
+                        // Build ReadDesc array for this thread's buckets
+                        for (size_t i = start_idx; i < end_idx; ++i) {
+                            auto& [bucket_id, plans_ptr] = bucket_list[i];
+                            auto& plans = *plans_ptr;
+
+                            auto filepath_res = GetBucketDataPath(bucket_id);
+                            if (!filepath_res) {
+                                result.error = ErrorCode::INTERNAL_ERROR;
+                                return result;
+                            }
+
+                            auto file_res = GetOrOpenFile(filepath_res.value(),
+                                                         FileMode::Read);
+                            if (!file_res) {
+                                result.error = file_res.error();
+                                return result;
+                            }
+                            auto& file = file_res.value();
+                            UringFile* uring_ptr =
+                                dynamic_cast<UringFile*>(file.get());
+                            if (!uring_ptr) {
+                                result.error = ErrorCode::INTERNAL_ERROR;
+                                return result;
+                            }
+                            files.push_back(file);
+
+                            for (const auto& plan : plans) {
+                                int64_t actual_offset =
+                                    plan.offset + plan.key_size;
+                                int64_t a_offset =
+                                    align_down(actual_offset, kDirectIOAlignment);
+                                int64_t data_end = actual_offset +
+                                    static_cast<int64_t>(plan.dest_slice.size);
+                                int64_t a_end = static_cast<int64_t>(align_up(
+                                    static_cast<size_t>(data_end),
+                                    kDirectIOAlignment));
+                                size_t a_size =
+                                    static_cast<size_t>(a_end - a_offset);
+
+                                descs.push_back({uring_ptr->fd(),
+                                                 plan.dest_slice.ptr, a_size,
+                                                 static_cast<off_t>(a_offset)});
+                                keys.push_back(plan.key);
+                                data_sizes.push_back(plan.dest_slice.size);
+                                offsets_in_buffer.push_back(actual_offset -
+                                                            a_offset);
+                            }
+                        }
+
+                        if (descs.empty()) return result;
+
+                        // Submit batch read for this thread's buckets
+                        auto batch_res = UringFile::batch_read_multi_fd(
+                            descs.data(), static_cast<int>(descs.size()));
+                        if (!batch_res) {
+                            result.error = batch_res.error();
+                            return result;
+                        }
+
+                        // Store results for post-processing
+                        result.keys = std::move(keys);
+                        result.adjusted_ptrs.reserve(descs.size());
+                        result.data_sizes = std::move(data_sizes);
+                        for (size_t i = 0; i < descs.size(); ++i) {
+                            const auto& desc = descs[i];
+                            const size_t min_required =
+                                static_cast<size_t>(offsets_in_buffer[i]) +
+                                result.data_sizes[i];
+                            // FLAT_MEMORY: retain upstream per-key read checks;
+                            // a batch total cannot prove a full read.
+                            if (!desc.completed || desc.error != ErrorCode::OK ||
+                                desc.bytes_read < min_required) {
+                                LOG(ERROR)
+                                    << "batch_read_multi_fd failed for key: "
+                                    << result.keys[i]
+                                    << ", completed=" << desc.completed
+                                    << ", error=" << desc.error
+                                    << ", expected at least=" << min_required
+                                    << ", got=" << desc.bytes_read;
+                                result.error = desc.error != ErrorCode::OK
+                                                   ? desc.error
+                                                   : ErrorCode::FILE_READ_FAIL;
+                                return result;
+                            }
+                            result.adjusted_ptrs.push_back(
+                                static_cast<char*>(desc.buf) +
+                                offsets_in_buffer[i]);
+                            result.bytes_read += desc.bytes_read;
+                        }
+                        return result;
+                    }));
+            } catch (...) {
+                LOG(ERROR) << "Failed to submit parallel bucket read";
+                any_error = true;
+                first_error = ErrorCode::INTERNAL_ERROR;
+                break;
+            }
+        }
+
+        // FLAT_MEMORY: drain every submitted future, including on exceptions,
+        // before read plans, destination buffers or bucket guards can be freed.
+        for (auto& fut : futures) {
+            try {
+                auto result = fut.get();
+                if (result.error != ErrorCode::OK) {
+                    if (!any_error) {
+                        any_error = true;
+                        first_error = result.error;
+                    }
+                    continue;
+                }
+
+                // Update batch_object with adjusted pointers
+                for (size_t i = 0; i < result.keys.size(); ++i) {
+                    batch_object.at(result.keys[i]).ptr = result.adjusted_ptrs[i];
+                }
+                total_read_bytes += result.bytes_read;
+            } catch (...) {
+                LOG(ERROR) << "Parallel bucket read task failed";
+                if (!any_error) {
+                    any_error = true;
+                    first_error = ErrorCode::INTERNAL_ERROR;
+                }
+            }
+        }
+
+        if (any_error) {
+            LOG(ERROR) << "P5 multi-thread read failed, error: " << first_error;
+            return tl::make_unexpected(first_error);
+        }
+    } else {
+        // Single-thread fallback (P1+P2+P3 only) or non-thread-pool path
+        // Track per-key alignment info for post-processing
+        struct AlignedReadInfo {
+            std::string key;           // key in batch_object to adjust ptr
+            size_t data_size;          // original unaligned data size
+            int64_t offset_in_buffer;  // ptr adjustment for O_DIRECT alignment
+        };
+
+        std::vector<UringFile::ReadDescMultiFd> all_descs;
+        std::vector<AlignedReadInfo> all_infos;
+        std::vector<std::shared_ptr<StorageFile>> all_files;  // keep files alive
+        bool all_uring = true;
+
+        // Phase 1: Open files and build cross-bucket ReadDesc array
+        // P1: GetOrOpenFile() reuses cached fds — no open()/close() overhead
+        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto filepath_res = GetBucketDataPath(bucket_id);
+            if (!filepath_res) {
+                LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                           << bucket_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            // P1: Use GetOrOpenFile for fd caching
+            auto file_res = GetOrOpenFile(filepath_res.value(), FileMode::Read);
+            if (!file_res) {
+                LOG(ERROR) << "Failed to open bucket file: "
+                           << filepath_res.value();
+                return tl::make_unexpected(file_res.error());
+            }
+            auto& file = file_res.value();
+            UringFile* uring_ptr = dynamic_cast<UringFile*>(file.get());
+            if (!uring_ptr) {
+                all_uring = false;
+                break;
+            }
+            all_files.push_back(file);  // keep file alive
+
+            // Build ReadDescMultiFd entries for every key in this bucket
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t a_offset = align_down(actual_offset, kDirectIOAlignment);
+                int64_t data_end = actual_offset +
+                                   static_cast<int64_t>(plan.dest_slice.size);
+                int64_t a_end = static_cast<int64_t>(
+                    align_up(static_cast<size_t>(data_end), kDirectIOAlignment));
+                size_t a_size = static_cast<size_t>(a_end - a_offset);
+
+                all_descs.push_back({uring_ptr->fd(), plan.dest_slice.ptr, a_size,
+                                     static_cast<off_t>(a_offset)});
+                all_infos.push_back({plan.key, plan.dest_slice.size,
+                                     actual_offset - a_offset});
+            }
+        }
+
+        if (all_uring && !all_descs.empty()) {
+            // Phase 2: Submit ALL reads across ALL buckets at once
+            // P3: NVMe sees QD = min(total_keys, 500) per io_uring_submit
+            auto batch_res = UringFile::batch_read_multi_fd(
+                all_descs.data(), static_cast<int>(all_descs.size()));
+            if (!batch_res) {
+                LOG(ERROR) << "batch_read_multi_fd failed, error: "
+                           << batch_res.error();
+                return tl::make_unexpected(batch_res.error());
+            }
+
+            // Phase 3: Post-process — adjust pointers for O_DIRECT alignment
+            for (size_t i = 0; i < all_infos.size(); ++i) {
+                const auto& info = all_infos[i];
+                const auto& desc = all_descs[i];
+                const size_t min_required =
+                    static_cast<size_t>(info.offset_in_buffer) + info.data_size;
+                if (!desc.completed || desc.error != ErrorCode::OK ||
+                    desc.bytes_read < min_required) {
+                    LOG(ERROR) << "batch_read_multi_fd failed for key: "
+                               << info.key << ", completed=" << desc.completed
+                               << ", error=" << desc.error
+                               << ", expected at least=" << min_required
+                               << ", got=" << desc.bytes_read;
+                    return tl::make_unexpected(desc.error != ErrorCode::OK
+                                                   ? desc.error
+                                                   : ErrorCode::FILE_READ_FAIL);
+                }
+                batch_object.at(info.key).ptr =
+                    static_cast<char*>(desc.buf) + info.offset_in_buffer;
+                total_read_bytes += desc.bytes_read;
+            }
+        } else if (!all_uring) {
+            // Fallback: at least one file is not UringFile — use serial path
+            goto serial_fallback;
+        }
+    }
+    goto read_done;
+
+serial_fallback:
+#endif
+    // Non-io_uring fallback: serial per-key reads
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
-        // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-
         auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
         if (!file_res) {
             LOG(ERROR) << "Failed to open bucket file: "
@@ -2022,84 +2310,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             return tl::make_unexpected(file_res.error());
         }
         auto& file = file_res.value();
-
-#ifdef USE_URING
-        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-        if (uring_file != nullptr) {
-            struct BatchReadPlan {
-                const ReadPlan* plan;
-                size_t offset_in_buffer;
-                size_t min_required;
-            };
-
-            std::vector<UringFile::ReadDesc> read_descs;
-            std::vector<BatchReadPlan> batch_read_plans;
-            read_descs.reserve(read_plans.size());
-            batch_read_plans.reserve(read_plans.size());
-
-            for (const auto& plan : read_plans) {
-                int64_t actual_offset = plan.offset + plan.key_size;
-                int64_t aligned_offset =
-                    align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
-                int64_t aligned_end = static_cast<int64_t>(align_up(
-                    static_cast<size_t>(data_end), kDirectIOAlignment));
-                size_t aligned_size =
-                    static_cast<size_t>(aligned_end - aligned_offset);
-                size_t offset_in_buffer =
-                    static_cast<size_t>(actual_offset - aligned_offset);
-
-                read_descs.push_back(UringFile::ReadDesc{
-                    plan.dest_slice.ptr, aligned_size, aligned_offset});
-                batch_read_plans.push_back(
-                    BatchReadPlan{&plan, offset_in_buffer,
-                                  offset_in_buffer + plan.dest_slice.size});
-            }
-
-            auto batch_read_result = uring_file->batch_read(
-                read_descs.data(), static_cast<int>(read_descs.size()));
-            if (!batch_read_result) {
-                for (size_t i = 0; i < read_descs.size(); ++i) {
-                    if (read_descs[i].error == ErrorCode::OK) continue;
-                    LOG(ERROR)
-                        << "batch_read failed for key: "
-                        << batch_read_plans[i].plan->key
-                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
-                        << ", error=" << read_descs[i].error;
-                }
-                return tl::make_unexpected(batch_read_result.error());
-            }
-
-            for (size_t i = 0; i < read_descs.size(); ++i) {
-                const auto& desc = read_descs[i];
-                const auto& batch_plan = batch_read_plans[i];
-                const auto& plan = *batch_plan.plan;
-                if (!desc.completed) {
-                    LOG(ERROR)
-                        << "batch_read did not complete for key: " << plan.key
-                        << ", bucket_id=" << plan.bucket_id;
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                }
-                if (desc.bytes_read < batch_plan.min_required) {
-                    LOG(ERROR)
-                        << "batch_read short read for key: " << plan.key
-                        << ", bucket_id=" << plan.bucket_id
-                        << ", expected at least: " << batch_plan.min_required
-                        << " (aligned_size=" << desc.len
-                        << ", data_size=" << plan.dest_slice.size
-                        << "), got: " << desc.bytes_read;
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                }
-                batch_object.at(plan.key).ptr =
-                    static_cast<char*>(plan.dest_slice.ptr) +
-                    batch_plan.offset_in_buffer;
-                total_read_bytes += desc.bytes_read;
-            }
-            continue;
-        }
-#endif
-
         for (const auto& plan : read_plans) {
             int64_t actual_offset = plan.offset + plan.key_size;
             iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
@@ -2120,6 +2330,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         }
     }
 
+#ifdef USE_URING
+read_done:
+#endif
+
     auto read_elapsed_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - read_start)
@@ -2131,12 +2345,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
         double read_gbps =
             static_cast<double>(total_read_bytes) /
             (1024.0 * 1024.0 * 1024.0) / read_sec;
+        // P5: indicate whether multi-threaded path was used
+        const char* mode = (read_thread_pool_ && bucket_read_plans.size() > 1)
+                               ? "P5-multithread"
+                               : "P1+P2+P3-single";
         LOG(INFO) << "[MOONCAKE_SSD_BW] SSD READ bandwidth: "
                   << std::fixed << std::setprecision(1) << read_mb
                   << " MB in " << read_elapsed_us / 1000 << " ms = "
                   << std::setprecision(2) << read_gbps << " GB/s"
                   << " (" << batch_object.size() << " keys, "
-                  << bucket_read_plans.size() << " buckets)";
+                  << bucket_read_plans.size() << " buckets, " << mode << ")";
     }
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
@@ -2384,6 +2602,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
+
+#ifdef USE_URING
+        // P5: Reuse read workers and their thread-local io_uring rings.
+        const int read_parallelism =
+            Environ::GetInt("MOONCAKE_READ_PARALLELISM", 8);
+        if (file_storage_config_.use_uring && read_parallelism > 1) {
+            read_thread_pool_ = std::make_unique<ThreadPool>(read_parallelism);
+            LOG(INFO) << "[MOONCAKE_SSD_OPT] Read thread pool created with "
+                      << read_parallelism << " threads";
+        }
+#endif
+
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -3770,6 +4000,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
+        // FLAT_MEMORY: drop P1's cached fd before unlinking the bucket.
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path_res.value());
+        }
         fs::remove(data_path_res.value(), ec);
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(WARNING) << "DeleteBucket: failed to remove data file: "

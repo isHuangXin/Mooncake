@@ -218,7 +218,7 @@ class UringFile : public StorageFile {
                                                   size_t length,
                                                   off_t offset = 0);
 
-    // Batch read: submit up to 32 independent reads at once (each at its own
+    // Batch read: submit up to QUEUE_DEPTH reads at once (each at its own
     // offset) before waiting for completions, giving NVMe queue depth > 1.
     // Use in BatchLoadBucket instead of per-key read_aligned() loops.
     struct ReadDesc {
@@ -230,6 +230,32 @@ class UringFile : public StorageFile {
         bool completed = false;
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
+
+    // FLAT_MEMORY: Cross-fd batch read — submit up to QUEUE_DEPTH independent
+    // reads (each from a different fd) in one io_uring ring submission.
+    // Mirrors batch_write_multi_fd() but for reads.  Used by BatchLoad to
+    // submit reads across ALL bucket files in a single io_uring submission,
+    // maximising NVMe queue depth.
+    struct ReadDescMultiFd {
+        int fd;            ///< source file descriptor
+        void *buf;         ///< aligned destination buffer
+        size_t len;        ///< aligned read length
+        off_t off;         ///< file offset
+        // FLAT_MEMORY: preserve v0.3.13's per-request completion checks.
+        size_t bytes_read = 0;
+        ErrorCode error = ErrorCode::OK;
+        bool completed = false;
+    };
+    static tl::expected<size_t, ErrorCode> batch_read_multi_fd(
+        ReadDescMultiFd *descs, int cnt);
+
+    // P4: Async prefetch API — submit reads without blocking, collect later.
+    // This enables pipelining: while processing current batch, submit next batch.
+    // FLAT_MEMORY: one outstanding batch per thread; keep fds and buffers alive
+    // until collect_pending_reads() on that same thread has returned.
+    static int submit_reads_async(const ReadDescMultiFd *descs, int cnt);
+    static tl::expected<size_t, ErrorCode> collect_pending_reads();
+    static int pending_read_count();
 
     // MOONCAKE_SSD_OPT: Cross-fd batch write — submit up to QUEUE_DEPTH
     // independent writes (each to a different fd) in one io_uring ring
