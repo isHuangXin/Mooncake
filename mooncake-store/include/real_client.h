@@ -74,6 +74,38 @@ class ResourceTracker {
     std::jthread signal_thread_{};  // joins on destruction
 };
 
+// FLAT_MEMORY: I/O statistics snapshot (plain POD, returnable by value)
+struct IoStatsSnapshot {
+    uint64_t dram_write_bytes = 0;
+    uint64_t dram_write_ns = 0;
+    uint64_t dram_write_ops = 0;
+    uint64_t dram_read_bytes = 0;
+    uint64_t dram_read_ns = 0;
+    uint64_t dram_read_ops = 0;
+    uint64_t ssd_write_bytes = 0;
+    uint64_t ssd_write_ns = 0;
+    uint64_t ssd_write_ops = 0;
+    uint64_t ssd_read_bytes = 0;
+    uint64_t ssd_read_ns = 0;
+    uint64_t ssd_read_ops = 0;
+};
+
+// FLAT_MEMORY: I/O statistics for per-backend bandwidth tracking (atomic, in-place)
+struct IoStats {
+    std::atomic<uint64_t> dram_write_bytes{0};
+    std::atomic<uint64_t> dram_write_ns{0};
+    std::atomic<uint64_t> dram_write_ops{0};
+    std::atomic<uint64_t> dram_read_bytes{0};
+    std::atomic<uint64_t> dram_read_ns{0};
+    std::atomic<uint64_t> dram_read_ops{0};
+    std::atomic<uint64_t> ssd_write_bytes{0};
+    std::atomic<uint64_t> ssd_write_ns{0};
+    std::atomic<uint64_t> ssd_write_ops{0};
+    std::atomic<uint64_t> ssd_read_bytes{0};
+    std::atomic<uint64_t> ssd_read_ns{0};
+    std::atomic<uint64_t> ssd_read_ops{0};
+};
+
 class RealClient : public PyClient {
    public:
     RealClient();
@@ -1062,6 +1094,12 @@ class RealClient : public PyClient {
     void teardown_ascend_shm_buffer(MappedShm &shm);
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
+
+    // FLAT_MEMORY: shared with FileStorage, which can outlive this client.
+    std::shared_ptr<IoStats> io_stats_ = std::make_shared<IoStats>();
+
+    // FLAT_MEMORY: return cumulative counters without resetting them.
+    IoStatsSnapshot get_and_reset_io_stats();
 
    private:
     std::unordered_map<std::string, MountedSegmentRecord>

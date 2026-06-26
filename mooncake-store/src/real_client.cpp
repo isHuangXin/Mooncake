@@ -1134,7 +1134,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         file_storage_ = std::make_shared<FileStorage>(
             file_storage_config, client_, this->local_rpc_addr,
-            client_->GetSsdMetricPtr());
+            client_->GetSsdMetricPtr(), io_stats_);
         auto init_result = file_storage_->Init();
         if (!init_result) {
             LOG(ERROR) << "file storage init failed with error: "
@@ -4182,8 +4182,36 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
         }
     }
 
+    // FLAT_MEMORY: Time DRAM write and accumulate stats
+    auto dram_write_start = std::chrono::steady_clock::now();
     // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, ordered_batched_slices, config);
+    auto batch_results = client_->BatchPut(keys, ordered_batched_slices, config);
+    auto dram_write_end = std::chrono::steady_clock::now();
+
+    // FLAT_MEMORY: Accumulate DRAM write stats for successful ops
+    uint64_t dram_write_total_bytes = 0;
+    uint64_t dram_write_success_ops = 0;
+    for (size_t i = 0; i < batch_results.size(); ++i) {
+        // FLAT_MEMORY: do not classify v0.3.13's mixed NoF/DFS writes as DRAM.
+        if (batch_results[i] && config.replica_num > 0 &&
+            config.nof_replica_num == 0 && config.dfs_replica_num == 0) {
+            dram_write_total_bytes += sizes[i];
+            dram_write_success_ops++;
+        }
+    }
+    if (dram_write_total_bytes > 0) {
+        auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                      dram_write_end - dram_write_start)
+                      .count();
+        io_stats_->dram_write_bytes.fetch_add(dram_write_total_bytes,
+                                             std::memory_order_relaxed);
+        io_stats_->dram_write_ns.fetch_add(static_cast<uint64_t>(ns),
+                                          std::memory_order_relaxed);
+        io_stats_->dram_write_ops.fetch_add(dram_write_success_ops,
+                                           std::memory_order_relaxed);
+    }
+
+    return batch_results;
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -5200,9 +5228,16 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         batch_slices[op.key] = op.slices;
     }
     if (!valid_operations.empty()) {
+        // FLAT_MEMORY: Time DRAM read path
+        auto dram_read_start = std::chrono::steady_clock::now();
         // Execute batch transfer
         const auto batch_get_results =
             client_->BatchGet(batch_keys, batch_query_results, batch_slices);
+        auto dram_read_end = std::chrono::steady_clock::now();
+
+        // FLAT_MEMORY: Accumulate DRAM read stats for successful ops
+        uint64_t dram_read_total_bytes = 0;
+        uint64_t dram_read_success_ops = 0;
 
         // Process transfer results
         for (size_t j = 0; j < batch_get_results.size(); ++j) {
@@ -5213,7 +5248,23 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+            } else if (op.query_result.replicas.front().is_memory_replica()) {
+                // FLAT_MEMORY: valid_operations also contains NoF in v0.3.13.
+                dram_read_total_bytes += op.total_size;
+                dram_read_success_ops++;
             }
+        }
+
+        if (dram_read_total_bytes > 0) {
+            auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          dram_read_end - dram_read_start)
+                          .count();
+            io_stats_->dram_read_bytes.fetch_add(dram_read_total_bytes,
+                                                std::memory_order_relaxed);
+            io_stats_->dram_read_ns.fetch_add(static_cast<uint64_t>(ns),
+                                             std::memory_order_relaxed);
+            io_stats_->dram_read_ops.fetch_add(dram_read_success_ops,
+                                              std::memory_order_relaxed);
         }
     }
 
@@ -5310,8 +5361,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
     }
 
     [[maybe_unused]] size_t offload_object_count = 0;
-    [[maybe_unused]] auto start_read_store_time =
-        std::chrono::steady_clock::now();
+    uint64_t ssd_read_total_bytes = 0;  // FLAT_MEMORY
+    uint64_t ssd_read_success_ops = 0;
+    auto start_read_store_time = std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
@@ -5335,8 +5387,26 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
             if (!checksum_result) {
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
+            } else {
+                // FLAT_MEMORY: count only reads accepted by upstream checks.
+                ssd_read_total_bytes += op.total_size;
+                ++ssd_read_success_ops;
             }
         }
+    }
+
+    // FLAT_MEMORY: Accumulate SSD read stats
+    if (ssd_read_total_bytes > 0) {
+        auto ssd_read_end = std::chrono::steady_clock::now();
+        auto ssd_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                          ssd_read_end - start_read_store_time)
+                          .count();
+        io_stats_->ssd_read_bytes.fetch_add(ssd_read_total_bytes,
+                                           std::memory_order_relaxed);
+        io_stats_->ssd_read_ns.fetch_add(static_cast<uint64_t>(ssd_ns),
+                                        std::memory_order_relaxed);
+        io_stats_->ssd_read_ops.fetch_add(ssd_read_success_ops,
+                                          std::memory_order_relaxed);
     }
 
     auto end_time = std::chrono::steady_clock::now();
@@ -7015,4 +7085,38 @@ tl::expected<ReturnType, ErrorCode> ClientRequester::invoke_rpc(
             co_return result->result();
         }());
 }
+
+// FLAT_MEMORY: Get I/O statistics (cumulative, non-resetting)
+// Uses load() instead of exchange(0) so Prometheus gauges always reflect
+// the total cumulative values. bench_serving.py reads once at the end and
+// gets the full picture. Same pattern as FlatMemoryManager::GetBandwidthReport().
+IoStatsSnapshot RealClient::get_and_reset_io_stats() {
+    IoStatsSnapshot snapshot;
+    snapshot.dram_write_bytes =
+        io_stats_->dram_write_bytes.load(std::memory_order_relaxed);
+    snapshot.dram_write_ns =
+        io_stats_->dram_write_ns.load(std::memory_order_relaxed);
+    snapshot.dram_write_ops =
+        io_stats_->dram_write_ops.load(std::memory_order_relaxed);
+    snapshot.dram_read_bytes =
+        io_stats_->dram_read_bytes.load(std::memory_order_relaxed);
+    snapshot.dram_read_ns =
+        io_stats_->dram_read_ns.load(std::memory_order_relaxed);
+    snapshot.dram_read_ops =
+        io_stats_->dram_read_ops.load(std::memory_order_relaxed);
+    snapshot.ssd_write_bytes =
+        io_stats_->ssd_write_bytes.load(std::memory_order_relaxed);
+    snapshot.ssd_write_ns =
+        io_stats_->ssd_write_ns.load(std::memory_order_relaxed);
+    snapshot.ssd_write_ops =
+        io_stats_->ssd_write_ops.load(std::memory_order_relaxed);
+    snapshot.ssd_read_bytes =
+        io_stats_->ssd_read_bytes.load(std::memory_order_relaxed);
+    snapshot.ssd_read_ns =
+        io_stats_->ssd_read_ns.load(std::memory_order_relaxed);
+    snapshot.ssd_read_ops =
+        io_stats_->ssd_read_ops.load(std::memory_order_relaxed);
+    return snapshot;
+}
+
 }  // namespace mooncake

@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "real_client.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
@@ -43,14 +44,16 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
                          const std::string& local_rpc_addr,
-                         SsdMetric* ssd_metric)
+                         SsdMetric* ssd_metric,
+                         std::shared_ptr<IoStats> io_stats)
     : config_(config),
       client_(client),
       ssd_metric_(ssd_metric),
       local_rpc_addr_(local_rpc_addr),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
-          config.local_buffer_size, client ? client->GetProtocol() : "")) {
+          config.local_buffer_size, client ? client->GetProtocol() : "")),
+      io_stats_(std::move(io_stats)) {
     if (config_.storage_backend_type == StorageBackendType::kDistributed) {
         config_.enable_dfs = true;
     }
@@ -613,6 +616,15 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        // FLAT_MEMORY: Compute bytes being offloaded (serial path)
+        size_t serial_write_bytes = 0;
+        for (const auto& obj : host_batch_object) {
+            for (const auto& slice : obj.second) {
+                serial_write_bytes += slice.size;
+            }
+        }
+
+        auto serial_offload_start = std::chrono::steady_clock::now();
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler,
             [this](const std::vector<std::string>& evicted_keys) {
@@ -649,6 +661,27 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 break;
             }
             // Soft per-bucket error: keep processing the remaining buckets.
+        } else if (io_stats_ && serial_write_bytes > 0) {
+            // FLAT_MEMORY: Accumulate SSD write stats (serial path)
+            auto serial_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - serial_offload_start)
+                    .count();
+            io_stats_->ssd_write_bytes.fetch_add(serial_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->ssd_write_ns.fetch_add(
+                static_cast<uint64_t>(serial_ns), std::memory_order_relaxed);
+            io_stats_->ssd_write_ops.fetch_add(
+                static_cast<uint64_t>(host_batch_object.size()),
+                std::memory_order_relaxed);
+            // Also count as DRAM read (eviction staging)
+            io_stats_->dram_read_bytes.fetch_add(serial_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->dram_read_ns.fetch_add(
+                static_cast<uint64_t>(serial_ns), std::memory_order_relaxed);
+            io_stats_->dram_read_ops.fetch_add(
+                static_cast<uint64_t>(host_batch_object.size()),
+                std::memory_order_relaxed);
         }
     }
 
@@ -681,10 +714,12 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                             "Phase 2/3";
         }
 
-        auto phase1_elapsed =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
+        auto phase1_ns =
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now() - pipeline_start)
                 .count();
+        auto phase1_elapsed = phase1_ns / 1000000;
+        int64_t phase2_ns = 0;
         int64_t phase2_elapsed = 0;
         int64_t phase3_elapsed = 0;
         size_t total_write_bytes = 0;
@@ -697,10 +732,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!abort_error && !prepared.empty()) {
             auto phase2_start = std::chrono::steady_clock::now();
             auto flush_res = bucket_backend->FlushPreparedBuckets(prepared);
-            phase2_elapsed =
-                std::chrono::duration_cast<std::chrono::milliseconds>(
+            phase2_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::steady_clock::now() - phase2_start)
                     .count();
+            phase2_elapsed = phase2_ns / 1000000;
             if (!flush_res) {
                 LOG(ERROR) << "Phase2: FlushPreparedBuckets failed: "
                            << flush_res.error();
@@ -788,6 +824,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                   << total_elapsed << "ms (P1=" << phase1_elapsed
                   << "ms, P2=" << phase2_elapsed
                   << "ms, P3=" << phase3_elapsed << "ms)";
+
+        // FLAT_MEMORY: Accumulate SSD write stats to RealClient's IoStats
+        if (io_stats_ && total_write_bytes > 0) {
+            // Use Phase 2 flush time (I/O + durability) for SSD write bandwidth
+            io_stats_->ssd_write_bytes.fetch_add(total_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->ssd_write_ns.fetch_add(static_cast<uint64_t>(phase2_ns),
+                                              std::memory_order_relaxed);
+            io_stats_->ssd_write_ops.fetch_add(
+                static_cast<uint64_t>(prepared.size()),
+                std::memory_order_relaxed);
+
+            // Also count as DRAM read (eviction staging: data read from DRAM
+            // segments during Phase 1 serialization)
+            io_stats_->dram_read_bytes.fetch_add(total_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->dram_read_ns.fetch_add(
+                static_cast<uint64_t>(phase1_ns > 0 ? phase1_ns : 0),
+                std::memory_order_relaxed);
+            io_stats_->dram_read_ops.fetch_add(
+                static_cast<uint64_t>(prepared.size()),
+                std::memory_order_relaxed);
+        }
 
         // FLAT_MEMORY: Log multi-perspective SSD write bandwidth
         // ① burst (Phase 2 only), ② end-to-end (P1+P2+P3), ③ experiment-wide

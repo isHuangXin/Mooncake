@@ -9,12 +9,15 @@
 namespace mooncake {
 
 struct SsdMetric;
+// Forward declaration
+struct IoStats;
 
 class FileStorage {
    public:
     FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
                 const std::string& local_rpc_addr,
-                SsdMetric* ssd_metric = nullptr);
+                SsdMetric* ssd_metric = nullptr,
+                std::shared_ptr<IoStats> io_stats = nullptr);
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
@@ -241,6 +244,10 @@ class FileStorage {
     std::atomic<size_t> cumulative_read_bytes_{0};
     std::atomic<int64_t> first_write_ts_us_{0};  // epoch microseconds, 0 = unset
     std::atomic<int64_t> first_read_ts_us_{0};   // epoch microseconds, 0 = unset
+
+    // FLAT_MEMORY: Pointer to RealClient's IoStats for per-backend bandwidth
+    // tracking. Shared ownership keeps stats alive until offload workers stop.
+    std::shared_ptr<IoStats> io_stats_;
 };
 
 }  // namespace mooncake
