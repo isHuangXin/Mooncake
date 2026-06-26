@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "aligned_client_buffer.hpp"
+#include "real_client.h"
 #include "storage_backend.h"
 #include "utils.h"
 #ifdef USE_URING
@@ -147,12 +148,14 @@ bool FileStorageConfig::Validate() const {
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
-                         const std::string& local_rpc_addr)
+                         const std::string& local_rpc_addr,
+                         IoStats* io_stats)
     : config_(config),
       client_(client),
       local_rpc_addr_(local_rpc_addr),
       client_buffer_allocator_(
-          AlignedClientBufferAllocator::create(config.local_buffer_size, "")) {
+          AlignedClientBufferAllocator::create(config.local_buffer_size, "")),
+      io_stats_(io_stats) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -437,6 +440,15 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 }
             };
 
+            // FLAT_MEMORY: Compute bytes being offloaded (serial path)
+            size_t serial_write_bytes = 0;
+            for (const auto& obj : batch_object) {
+                for (const auto& slice : obj.second) {
+                    serial_write_bytes += slice.size;
+                }
+            }
+
+            auto serial_offload_start = std::chrono::steady_clock::now();
             auto offload_res = storage_backend_->BatchOffload(
                 batch_object, complete_handler, eviction_handler);
             if (!offload_res) {
@@ -450,6 +462,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 if (offload_res.error() != ErrorCode::INVALID_READ) {
                     return tl::make_unexpected(offload_res.error());
                 }
+            } else if (io_stats_ && serial_write_bytes > 0) {
+                // FLAT_MEMORY: Accumulate SSD write stats (serial path)
+                auto serial_ns =
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now() - serial_offload_start)
+                        .count();
+                io_stats_->ssd_write_bytes.fetch_add(serial_write_bytes,
+                                                     std::memory_order_relaxed);
+                io_stats_->ssd_write_ns.fetch_add(
+                    static_cast<uint64_t>(serial_ns),
+                    std::memory_order_relaxed);
+                io_stats_->ssd_write_ops.fetch_add(
+                    static_cast<uint64_t>(batch_object.size()),
+                    std::memory_order_relaxed);
+                // Also count as DRAM read (eviction staging)
+                io_stats_->dram_read_bytes.fetch_add(serial_write_bytes,
+                                                     std::memory_order_relaxed);
+                io_stats_->dram_read_ns.fetch_add(
+                    static_cast<uint64_t>(serial_ns),
+                    std::memory_order_relaxed);
+                io_stats_->dram_read_ops.fetch_add(
+                    static_cast<uint64_t>(batch_object.size()),
+                    std::memory_order_relaxed);
             }
         }
     } else {
@@ -625,6 +660,38 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // ① burst (Phase 2 only), ② end-to-end (P1+P2+P3), ③ experiment-wide
         size_t total_write_bytes = 0;
         for (const auto& p : prepared) total_write_bytes += p.aligned_size;
+
+        // FLAT_MEMORY: Accumulate SSD write stats to RealClient's IoStats
+        if (io_stats_ && total_write_bytes > 0) {
+            // Use Phase 2 time (pure io_uring) for SSD write bandwidth
+            auto phase2_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - phase2_start)
+                    .count();
+            io_stats_->ssd_write_bytes.fetch_add(total_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->ssd_write_ns.fetch_add(static_cast<uint64_t>(phase2_ns),
+                                              std::memory_order_relaxed);
+            io_stats_->ssd_write_ops.fetch_add(
+                static_cast<uint64_t>(prepared.size()),
+                std::memory_order_relaxed);
+
+            // Also count as DRAM read (eviction staging: data read from DRAM
+            // segments during Phase 1 serialization)
+            auto phase1_ns =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    std::chrono::steady_clock::now() - offload_start)
+                    .count() -
+                phase2_ns;
+            io_stats_->dram_read_bytes.fetch_add(total_write_bytes,
+                                                 std::memory_order_relaxed);
+            io_stats_->dram_read_ns.fetch_add(
+                static_cast<uint64_t>(phase1_ns > 0 ? phase1_ns : 0),
+                std::memory_order_relaxed);
+            io_stats_->dram_read_ops.fetch_add(
+                static_cast<uint64_t>(prepared.size()),
+                std::memory_order_relaxed);
+        }
 
         // Update cumulative counters for experiment-wide tracking
         auto now_us = std::chrono::duration_cast<std::chrono::microseconds>(

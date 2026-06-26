@@ -59,6 +59,38 @@ class ResourceTracker {
     std::jthread signal_thread_{};  // joins on destruction
 };
 
+// FLAT_MEMORY: I/O statistics snapshot (plain POD, returnable by value)
+struct IoStatsSnapshot {
+    uint64_t dram_write_bytes = 0;
+    uint64_t dram_write_ns = 0;
+    uint64_t dram_write_ops = 0;
+    uint64_t dram_read_bytes = 0;
+    uint64_t dram_read_ns = 0;
+    uint64_t dram_read_ops = 0;
+    uint64_t ssd_write_bytes = 0;
+    uint64_t ssd_write_ns = 0;
+    uint64_t ssd_write_ops = 0;
+    uint64_t ssd_read_bytes = 0;
+    uint64_t ssd_read_ns = 0;
+    uint64_t ssd_read_ops = 0;
+};
+
+// FLAT_MEMORY: I/O statistics for per-backend bandwidth tracking (atomic, in-place)
+struct IoStats {
+    std::atomic<uint64_t> dram_write_bytes{0};
+    std::atomic<uint64_t> dram_write_ns{0};
+    std::atomic<uint64_t> dram_write_ops{0};
+    std::atomic<uint64_t> dram_read_bytes{0};
+    std::atomic<uint64_t> dram_read_ns{0};
+    std::atomic<uint64_t> dram_read_ops{0};
+    std::atomic<uint64_t> ssd_write_bytes{0};
+    std::atomic<uint64_t> ssd_write_ns{0};
+    std::atomic<uint64_t> ssd_write_ops{0};
+    std::atomic<uint64_t> ssd_read_bytes{0};
+    std::atomic<uint64_t> ssd_read_ns{0};
+    std::atomic<uint64_t> ssd_read_ops{0};
+};
+
 class RealClient : public PyClient {
    public:
     RealClient();
@@ -600,6 +632,12 @@ class RealClient : public PyClient {
 
     void handle_ipc_shm_register(int client_sock);
     void handle_ipc_shm_fd_request(int client_sock);
+
+    // FLAT_MEMORY: Per-backend I/O statistics
+    IoStats io_stats_;
+
+    // FLAT_MEMORY: Get and reset I/O stats (returns snapshot, then zeroes counters)
+    IoStatsSnapshot get_and_reset_io_stats();
 };
 
 }  // namespace mooncake

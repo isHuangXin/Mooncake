@@ -1865,7 +1865,40 @@ PYBIND11_MODULE(store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        // FLAT_MEMORY: Get and reset I/O stats for per-backend bandwidth tracking
+        .def(
+            "get_and_reset_io_stats",
+            [](MooncakeStorePyWrapper &self) -> py::dict {
+                py::gil_scoped_release release;
+                auto real_client =
+                    std::dynamic_pointer_cast<RealClient>(self.store_);
+                if (!real_client) {
+                    py::gil_scoped_acquire acquire;
+                    return py::dict();
+                }
+                auto stats = real_client->get_and_reset_io_stats();
+                py::gil_scoped_acquire acquire;
+                py::dict result;
+                result["dram_write_bytes"] = stats.dram_write_bytes;
+                result["dram_write_ns"] = stats.dram_write_ns;
+                result["dram_write_ops"] = stats.dram_write_ops;
+                result["dram_read_bytes"] = stats.dram_read_bytes;
+                result["dram_read_ns"] = stats.dram_read_ns;
+                result["dram_read_ops"] = stats.dram_read_ops;
+                result["ssd_write_bytes"] = stats.ssd_write_bytes;
+                result["ssd_write_ns"] = stats.ssd_write_ns;
+                result["ssd_write_ops"] = stats.ssd_write_ops;
+                result["ssd_read_bytes"] = stats.ssd_read_bytes;
+                result["ssd_read_ns"] = stats.ssd_read_ns;
+                result["ssd_read_ops"] = stats.ssd_read_ops;
+                return result;
+            },
+            "Get and reset I/O statistics for per-backend bandwidth tracking.\n"
+            "Returns a dict with dram_write_bytes, dram_write_ns, "
+            "dram_write_ops, dram_read_bytes, dram_read_ns, dram_read_ops, "
+            "ssd_write_bytes, ssd_write_ns, ssd_write_ops, ssd_read_bytes, "
+            "ssd_read_ns, ssd_read_ops.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(
