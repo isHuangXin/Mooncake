@@ -1476,6 +1476,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     size_t total_read_bytes = 0;
     auto read_start = std::chrono::steady_clock::now();
 
+    // FLAT_MEMORY: Default to serial QD=1 reads (original mooncake behavior).
+    // Set MOONCAKE_PARALLEL_READ=1 to enable multi-thread io_uring parallel reads
+    // (Flat Memory System optimization).
+    static const bool parallel_read = GetEnvOr<int>("MOONCAKE_PARALLEL_READ", 0) != 0;
+    if (!parallel_read) goto serial_fallback;
+
 #ifdef USE_URING
     // P5: Parallel reads using pre-created thread pool
     // Each thread handles a subset of buckets with batch_read_multi_fd
@@ -1690,7 +1696,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
 serial_fallback:
 #endif
-    // Non-io_uring fallback: serial per-key reads
+    // FLAT_MEMORY: Serial per-key reads with O_DIRECT alignment handling.
+    // When files are opened with O_DIRECT (UringFile), offset and buffer must
+    // be aligned to kDirectIOAlignment (4096). We allocate an aligned bounce
+    // buffer per-key and memcpy the result to the caller's destination.
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
@@ -1707,21 +1716,48 @@ serial_fallback:
         auto& file = file_res.value();
         for (const auto& plan : read_plans) {
             int64_t actual_offset = plan.offset + plan.key_size;
-            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-            auto read_res = file->vector_read(&iov, 1, actual_offset);
+            int64_t a_offset = align_down(actual_offset,
+                                          static_cast<int64_t>(kDirectIOAlignment));
+            int64_t data_end = actual_offset +
+                               static_cast<int64_t>(plan.dest_slice.size);
+            size_t a_size = static_cast<size_t>(
+                align_up(static_cast<size_t>(data_end), kDirectIOAlignment) -
+                static_cast<size_t>(a_offset));
+            size_t offset_in_buffer = static_cast<size_t>(actual_offset - a_offset);
+
+            // Allocate aligned bounce buffer for O_DIRECT read
+            void* aligned_buf = nullptr;
+            int r = posix_memalign(&aligned_buf, kDirectIOAlignment, a_size);
+            if (r != 0 || !aligned_buf) {
+                LOG(ERROR) << "posix_memalign failed for serial read, key: "
+                           << plan.key << ", size: " << a_size;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            iovec iov{aligned_buf, a_size};
+            auto read_res = file->vector_read(&iov, 1, a_offset);
             if (!read_res) {
+                free(aligned_buf);
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
                            << ", error: " << read_res.error();
                 return tl::make_unexpected(read_res.error());
             }
-            if (read_res.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
+            if (read_res.value() < offset_in_buffer + plan.dest_slice.size) {
+                free(aligned_buf);
+                LOG(ERROR) << "Read size insufficient for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_res.value();
+                           << ", got: " << read_res.value()
+                           << ", offset_in_buffer: " << offset_in_buffer;
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-            total_read_bytes += read_res.value();
+
+            // Copy from aligned bounce buffer to caller's destination
+            memcpy(plan.dest_slice.ptr,
+                   static_cast<char*>(aligned_buf) + offset_in_buffer,
+                   plan.dest_slice.size);
+            free(aligned_buf);
+            total_read_bytes += plan.dest_slice.size;
         }
     }
 
