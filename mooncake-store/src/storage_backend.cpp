@@ -2019,8 +2019,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // After P5: multi-thread + batch_read_multi_fd → target ~4-6 GB/s
     size_t total_read_bytes = 0;
     auto read_start = std::chrono::steady_clock::now();
+    const char* mode = "serial-per-key";
 
 #ifdef USE_URING
+    // FLAT_MEMORY: default to serial QD=1 reads for the baseline comparison.
+    // Set MOONCAKE_PARALLEL_READ=1 to enable the optimized io_uring paths.
+    static const bool parallel_read =
+        Environ::GetInt("MOONCAKE_PARALLEL_READ", 0) != 0;
+    if (!parallel_read || !file_storage_config_.use_uring) goto serial_fallback;
+
     // P5: Parallel reads using pre-created thread pool
     // Each thread handles a subset of buckets with batch_read_multi_fd
     if (file_storage_config_.use_uring && read_thread_pool_ &&
@@ -2291,11 +2298,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             goto serial_fallback;
         }
     }
+    mode = (read_thread_pool_ && bucket_read_plans.size() > 1)
+               ? "P5-multithread"
+               : "P1+P2+P3-single";
     goto read_done;
 
 serial_fallback:
 #endif
-    // Non-io_uring fallback: serial per-key reads
+    // FLAT_MEMORY: serial per-key reads with O_DIRECT alignment handling.
+    // Read into an aligned bounce buffer and copy to the caller's destination.
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
@@ -2312,21 +2323,47 @@ serial_fallback:
         auto& file = file_res.value();
         for (const auto& plan : read_plans) {
             int64_t actual_offset = plan.offset + plan.key_size;
-            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-            auto read_result = file->vector_read(&iov, 1, actual_offset);
+            int64_t a_offset = align_down(actual_offset, kDirectIOAlignment);
+            int64_t data_end =
+                actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+            size_t a_size =
+                align_up(static_cast<size_t>(data_end), kDirectIOAlignment) -
+                static_cast<size_t>(a_offset);
+            size_t offset_in_buffer =
+                static_cast<size_t>(actual_offset - a_offset);
+
+            // Allocate an aligned bounce buffer for this one O_DIRECT read.
+            void* aligned_buf = nullptr;
+            int r = posix_memalign(&aligned_buf, kDirectIOAlignment, a_size);
+            if (r != 0 || !aligned_buf) {
+                LOG(ERROR) << "posix_memalign failed for serial read, key: "
+                           << plan.key << ", size: " << a_size;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+
+            iovec iov{aligned_buf, a_size};
+            auto read_result = file->vector_read(&iov, 1, a_offset);
             if (!read_result) {
+                free(aligned_buf);
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
                            << ", error: " << read_result.error();
                 return tl::make_unexpected(read_result.error());
             }
-            if (read_result.value() != plan.dest_slice.size) {
-                LOG(ERROR) << "Read size mismatch for key: " << plan.key
+            if (read_result.value() < offset_in_buffer + plan.dest_slice.size) {
+                free(aligned_buf);
+                LOG(ERROR) << "Read size insufficient for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_result.value();
+                           << ", got: " << read_result.value()
+                           << ", offset_in_buffer: " << offset_in_buffer;
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-            total_read_bytes += read_result.value();
+
+            memcpy(plan.dest_slice.ptr,
+                   static_cast<char*>(aligned_buf) + offset_in_buffer,
+                   plan.dest_slice.size);
+            free(aligned_buf);
+            total_read_bytes += plan.dest_slice.size;
         }
     }
 
@@ -2345,10 +2382,6 @@ read_done:
         double read_gbps =
             static_cast<double>(total_read_bytes) /
             (1024.0 * 1024.0 * 1024.0) / read_sec;
-        // P5: indicate whether multi-threaded path was used
-        const char* mode = (read_thread_pool_ && bucket_read_plans.size() > 1)
-                               ? "P5-multithread"
-                               : "P1+P2+P3-single";
         LOG(INFO) << "[MOONCAKE_SSD_BW] SSD READ bandwidth: "
                   << std::fixed << std::setprecision(1) << read_mb
                   << " MB in " << read_elapsed_us / 1000 << " ms = "
