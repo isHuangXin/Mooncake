@@ -107,7 +107,26 @@ class OperationState {
      */
     virtual void wait_for_completion() = 0;
 
+    void ConfigureStorageIO(StorageIOKind kind, uint64_t bytes, uint64_t ops) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        assert(!result_.has_value() && !storage_io_kind_.has_value());
+        storage_io_kind_ = kind;
+        storage_io_bytes_ = bytes;
+        storage_io_ops_ = ops;
+    }
+
    protected:
+    void RecordStorageIOCompletion(ErrorCode error_code) {
+        if (!storage_io_kind_) return;
+        const bool success = error_code == ErrorCode::OK;
+        StorageIOMetric::Instance().Record(
+            *storage_io_kind_, success ? storage_io_bytes_ : 0,
+            success ? storage_io_ops_ : 0, success ? 0 : storage_io_ops_);
+    }
+
+    std::optional<StorageIOKind> storage_io_kind_;
+    uint64_t storage_io_bytes_ = 0;
+    uint64_t storage_io_ops_ = 0;
     std::optional<ErrorCode> result_ = std::nullopt;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -142,6 +161,7 @@ class MemcpyOperationState : public OperationState {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
             result_.emplace(error_code);
+            RecordStorageIOCompletion(error_code);
         }
         cv_.notify_all();
     }
@@ -197,6 +217,7 @@ class FilereadOperationState : public OperationState {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
             result_.emplace(error_code);
+            RecordStorageIOCompletion(error_code);
         }
         cv_.notify_all();
     }
@@ -641,7 +662,8 @@ class TransferSubmitter {
         uint64_t src_offset = 0);
 
     std::optional<TransferFuture> submitMemcpyOperations(
-        std::vector<MemcpyOperation> operations);
+        std::vector<MemcpyOperation> operations, uint64_t dram_ops = 0,
+        TransferRequest::OpCode op_code = TransferRequest::READ);
 
 #ifdef USE_NOF
     /**
@@ -680,7 +702,7 @@ class TransferSubmitter {
                                TransferRequest::OpCode op);
 
     std::optional<TransferFuture> submitTransfer(
-        std::vector<TransferRequest>& requests);
+        std::vector<TransferRequest>& requests, uint64_t dram_ops = 0);
 };
 
 }  // namespace mooncake

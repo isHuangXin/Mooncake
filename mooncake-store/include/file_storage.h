@@ -17,6 +17,8 @@ class FileStorage {
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
+    bool SupportsNativeIOMetrics() const;
 
     void RemoveAll();
 

@@ -819,6 +819,7 @@ void TransferEngineOperationState::set_result_internal(ErrorCode error_code) {
     VLOG(1) << "Setting transfer result for batch " << batch_id_ << " to "
             << static_cast<int>(error_code);
     result_.emplace(error_code);
+    RecordStorageIOCompletion(error_code);
 }
 
 void TransferEngineOperationState::wait_for_completion() {
@@ -891,6 +892,7 @@ void TransferEngineOperationState::wait_for_completion() {
             LOG(ERROR) << "Failed to complete transfers after "
                        << timeout_milliseconds << " milliseconds for batch "
                        << batch_id_;
+            std::lock_guard<std::mutex> lock(mutex_);
             set_result_internal(ErrorCode::TRANSFER_FAIL);
             return;
         }
@@ -1106,8 +1108,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
         }
     }
     auto future = use_local_memcpy
-                      ? submitMemcpyOperations(std::move(memcpy_operations))
-                      : submitTransfer(requests);
+                      ? submitMemcpyOperations(std::move(memcpy_operations),
+                                               replicas.size(), op_code)
+                      : submitTransfer(requests, replicas.size());
     // Update metrics on successful submission
     if (future.has_value()) {
         for (auto& slices : all_slices) {
@@ -1220,12 +1223,22 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     appendMemcpyOperations(handle, slices, op_code, src_offset, operations);
-    return submitMemcpyOperations(std::move(operations));
+    return submitMemcpyOperations(std::move(operations), 1, op_code);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
-    std::vector<MemcpyOperation> operations) {
+    std::vector<MemcpyOperation> operations, uint64_t dram_ops,
+    TransferRequest::OpCode op_code) {
     auto state = std::make_shared<MemcpyOperationState>();
+    // FLAT_MEMORY: configure completion accounting before the worker starts.
+    if (transfer_metric_ && dram_ops) {
+        uint64_t bytes = 0;
+        for (const auto& operation : operations) bytes += operation.size;
+        state->ConfigureStorageIO(
+            op_code == TransferRequest::READ ? StorageIOKind::DRAM_READ
+                                            : StorageIOKind::DRAM_WRITE,
+            bytes, dram_ops);
+    }
     const size_t operation_count = operations.size();
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
@@ -1237,7 +1250,7 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitTransfer(
-    std::vector<TransferRequest>& requests) {
+    std::vector<TransferRequest>& requests, uint64_t dram_ops) {
     // Allocate batch ID
     const size_t batch_size = requests.size();
     BatchID batch_id = engine_.allocateBatchID(batch_size);
@@ -1267,6 +1280,15 @@ std::optional<TransferFuture> TransferSubmitter::submitTransfer(
     // needed
     auto state = std::make_shared<TransferEngineOperationState>(
         engine_, batch_id, batch_size);
+    if (transfer_metric_ && dram_ops && !requests.empty()) {
+        uint64_t bytes = 0;
+        for (const auto& request : requests) bytes += request.length;
+        state->ConfigureStorageIO(
+            requests.front().opcode == TransferRequest::READ
+                ? StorageIOKind::DRAM_READ
+                : StorageIOKind::DRAM_WRITE,
+            bytes, dram_ops);
+    }
 
     return TransferFuture(state);
 }
@@ -1307,7 +1329,7 @@ std::optional<TransferFuture> TransferSubmitter::submitTransferEngineOperation(
         offset += slice.size;
         requests.emplace_back(request);
     }
-    return submitTransfer(requests);
+    return submitTransfer(requests, 1);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemoryReadOperation(

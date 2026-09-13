@@ -15,7 +15,11 @@ PosixFile::PosixFile(const std::string &filename, int fd)
 }
 
 tl::expected<void, ErrorCode> PosixFile::datasync() {
-    if (fdatasync(fd_) != 0) {
+    int result;
+    do {
+        result = ::fdatasync(fd_);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) {
         LOG(ERROR) << "fdatasync failed: " << strerror(errno);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }

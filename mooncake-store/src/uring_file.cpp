@@ -18,6 +18,7 @@
 
 #include "file_interface.h"
 #include "uring_submit.h"
+#include "client_metric.h"
 
 namespace mooncake {
 
@@ -111,12 +112,12 @@ class SharedUringRing {
     // -----------------------------------------------------------------
 
     tl::expected<size_t, ErrorCode> read(int fd, void* buf, size_t len,
-                                         off_t off) {
+                                         off_t off, bool track_reads = false) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
-        return submit_rw(/*write=*/false, fd, buf, len, off, fix);
+        return submit_rw(/*write=*/false, fd, buf, len, off, fix, track_reads);
     }
 
     tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
@@ -128,10 +129,11 @@ class SharedUringRing {
     }
 
     tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
-                                                int cnt, off_t off) {
+                                                int cnt, off_t off,
+                                                bool track_reads = false) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        return submit_vector(/*write=*/false, fd, iovs, cnt, off);
+        return submit_vector(/*write=*/false, fd, iovs, cnt, off, track_reads);
     }
 
     tl::expected<size_t, ErrorCode> vector_write(int fd, const iovec* iovs,
@@ -147,7 +149,8 @@ class SharedUringRing {
     /// Submit up to QUEUE_DEPTH reads at once (each at its own offset), then
     /// collect completions. Repeat until all @p cnt descs are done.
     /// This gives the NVMe device queue depth > 1 within a single thread.
-    tl::expected<void, ErrorCode> batch_read(int fd, ReadDesc* descs, int cnt) {
+    tl::expected<void, ErrorCode> batch_read(int fd, ReadDesc* descs, int cnt,
+                                             bool track_reads = false) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         ensure_buf_registered();
@@ -182,7 +185,7 @@ class SharedUringRing {
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
             }
 
-            auto res = collect_batch(batch, op, descs + idx);
+            auto res = collect_batch(batch, op, descs + idx, track_reads);
             if (!res) return res;
             idx += batch;
             remaining -= batch;
@@ -359,7 +362,8 @@ class SharedUringRing {
     // are already available, so io_uring_peek_cqe() succeeds without
     // a syscall in the common case.  io_uring_wait_cqe() only kicks
     // in when the ring is unexpectedly drained (stale CQE storms).
-    tl::expected<size_t, ErrorCode> collect(int expected, uint64_t op_id) {
+    tl::expected<size_t, ErrorCode> collect(int expected, uint64_t op_id,
+                                            bool track_reads = false) {
         if (!prepare_completions(expected, op_id)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -382,8 +386,16 @@ class SharedUringRing {
                 LOG(ERROR) << "[SharedUringRing] CQE error: "
                            << strerror(-cqe->res);
                 err = true;
+                if (track_reads) {
+                    StorageIOMetric::Instance().Record(
+                        StorageIOKind::SSD_READ, 0, 0, 1);
+                }
             } else {
                 total += static_cast<size_t>(cqe->res);
+                if (track_reads && cqe->res > 0) {
+                    StorageIOMetric::Instance().Record(
+                        StorageIOKind::SSD_READ, cqe->res, 1);
+                }
             }
             io_uring_cq_advance(&ring_, 1);
             ++processed;
@@ -393,7 +405,8 @@ class SharedUringRing {
     }
 
     tl::expected<void, ErrorCode> collect_batch(int expected, uint64_t op_id,
-                                                ReadDesc* descs) {
+                                                ReadDesc* descs,
+                                                bool track_reads = false) {
         if (!prepare_completions(expected, op_id)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
@@ -427,8 +440,16 @@ class SharedUringRing {
                                << strerror(-cqe->res);
                     desc.error = ErrorCode::FILE_READ_FAIL;
                     has_error = true;
+                    if (track_reads) {
+                        StorageIOMetric::Instance().Record(
+                            StorageIOKind::SSD_READ, 0, 0, 1);
+                    }
                 } else {
                     desc.bytes_read = static_cast<size_t>(cqe->res);
+                    if (track_reads && cqe->res > 0) {
+                        StorageIOMetric::Instance().Record(
+                            StorageIOKind::SSD_READ, cqe->res, 1);
+                    }
                 }
             }
             io_uring_cq_advance(&ring_, 1);
@@ -442,7 +463,8 @@ class SharedUringRing {
     // Chunked contiguous read or write.
     tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int fd, void* buf,
                                               size_t len, off_t off,
-                                              bool use_fixed_buf) {
+                                              bool use_fixed_buf,
+                                              bool track_reads = false) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
@@ -486,7 +508,7 @@ class SharedUringRing {
                 if (remaining == 0) break;
             }
 
-            auto res = collect(static_cast<int>(n), op);
+            auto res = collect(static_cast<int>(n), op, track_reads);
             if (!res) return res;
             total += res.value();
             if (!is_write && res.value() == 0) break;  // read EOF
@@ -501,7 +523,8 @@ class SharedUringRing {
     // Scatter/gather read or write (one SQE per iovec, sequential offsets).
     tl::expected<size_t, ErrorCode> submit_vector(bool is_write, int fd,
                                                   const iovec* iovs, int cnt,
-                                                  off_t off) {
+                                                  off_t off,
+                                                  bool track_reads = false) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const size_t max_io = max_rw_count();
@@ -516,7 +539,7 @@ class SharedUringRing {
             if (iovs[idx].iov_len > max_io) {
                 auto res = submit_rw(is_write, fd, iovs[idx].iov_base,
                                      iovs[idx].iov_len, cur,
-                                     /*use_fixed_buf=*/false);
+                                     /*use_fixed_buf=*/false, track_reads);
                 if (!res) return res;
                 total += res.value();
                 cur += static_cast<off_t>(iovs[idx].iov_len);
@@ -550,7 +573,7 @@ class SharedUringRing {
                 ++idx;
             }
 
-            auto res = collect(batch, op);
+            auto res = collect(batch, op, track_reads);
             if (!res) return res;
             total += res.value();
             remaining -= batch;
@@ -577,7 +600,9 @@ class SharedUringRing {
 
 UringFile::UringFile(const std::string& filename, int fd,
                      unsigned /*queue_depth*/, bool use_direct_io)
-    : StorageFile(filename, fd), use_direct_io_(use_direct_io) {
+    : StorageFile(filename, fd),
+      use_direct_io_(use_direct_io),
+      track_bucket_reads_(use_direct_io && filename.ends_with(".bucket")) {
     if (fd < 0) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         return;
@@ -707,7 +732,8 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
         read_ptr = buffer.data();
     }
 
-    auto res = SharedUringRing::instance().read(fd_, read_ptr, read_len, 0);
+    auto res = SharedUringRing::instance().read(
+        fd_, read_ptr, read_len, 0, track_bucket_reads_);
 
     if (use_direct_io_) {
         if (res) {
@@ -759,7 +785,8 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().read(fd_, buffer, length, offset);
+    return SharedUringRing::instance().read(
+        fd_, buffer, length, offset, track_bucket_reads_);
 }
 
 // ---------------------------------------------------------------------------
@@ -781,7 +808,8 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
         }
     }
 
-    return SharedUringRing::instance().batch_read(fd_, descs, cnt);
+    return SharedUringRing::instance().batch_read(fd_, descs, cnt,
+                                                  track_bucket_reads_);
 }
 
 // ---------------------------------------------------------------------------
@@ -814,7 +842,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
     auto start = std::chrono::steady_clock::now();
 
     auto res =
-        SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
+        SharedUringRing::instance().vector_read(
+            fd_, iov, iovcnt, offset, track_bucket_reads_);
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)

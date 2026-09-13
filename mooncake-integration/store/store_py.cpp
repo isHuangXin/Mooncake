@@ -516,6 +516,20 @@ class MooncakeStorePyWrapper {
         return real_client->drainLocalDiskSegment(grace_period_seconds);
     }
 
+    py::object get_storage_io_stats() {
+        auto real_client = std::dynamic_pointer_cast<RealClient>(store_);
+        if (!real_client || !is_client_initialized()) {
+            throw std::runtime_error(
+                "Native storage I/O metrics require an initialized RealClient");
+        }
+        std::string snapshot;
+        {
+            py::gil_scoped_release release;
+            snapshot = real_client->get_storage_io_stats();
+        }
+        return py::module_::import("json").attr("loads")(snapshot);
+    }
+
     std::string get_tp_key_name(const std::string &base_key, int rank) const {
         return base_key + "_tp_" + std::to_string(rank);
     }
@@ -2399,6 +2413,7 @@ PYBIND11_MODULE(store, m) {
                  self.store_.reset();
                  return rc;
              })
+        .def("get_storage_io_stats", &MooncakeStorePyWrapper::get_storage_io_stats)
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
