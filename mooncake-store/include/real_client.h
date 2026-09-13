@@ -247,6 +247,7 @@ class RealClient : public PyClient {
     int tearDownAll();
 
     int health_check() override;
+    std::string get_storage_io_stats();
 
     /**
      * @brief Check if an object exists

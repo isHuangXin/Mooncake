@@ -37,6 +37,8 @@
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
 const static size_t kDefaultBufferSize = 65536;
+// FLAT_MEMORY: Publication must wait for the receiver, not just the local send.
+const static uint8_t kWriteAck = 1;
 
 struct SessionHeader {
     uint64_t size;
@@ -159,6 +161,24 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
             });
     }
 
+    void writeAck() {
+        auto self(shared_from_this());
+        asio::async_write(
+            *socket_, asio::buffer(&kWriteAck, sizeof(kWriteAck)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                if (ec || len != sizeof(kWriteAck)) {
+                    LOG(ERROR) << "ServerSession::writeAck failed: "
+                               << ec.message() << ", bytes=" << len;
+                    asio::error_code ignored;
+                    socket_->close(ignored);
+                    session_mutex_.unlock();
+                    return;
+                }
+                session_mutex_.unlock();
+                start();
+            });
+    }
+
     void readBody() {
         auto self(shared_from_this());
         uint64_t size = le64toh(header_.size);
@@ -167,9 +187,7 @@ struct ServerSession : public std::enable_shared_from_this<ServerSession> {
         size_t buffer_size =
             std::min(kDefaultBufferSize, size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            session_mutex_.unlock();
-            // Transfer complete, wait for next request on this connection
-            start();
+            writeAck();
             return;
         }
 
@@ -243,6 +261,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     std::function<void(TransferStatusEnum)> on_finalize_;
     std::function<void()> on_complete_;  // Callback when transfer completes
     std::mutex session_mutex_;
+    uint8_t write_ack_ = 0;
 
     void initiate(void* buffer, uint64_t dest_addr, size_t size,
                   TransferRequest::OpCode opcode) {
@@ -347,6 +366,28 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
             });
     }
 
+    void readWriteAck() {
+        auto self(shared_from_this());
+        asio::async_read(
+            *socket_, asio::buffer(&write_ack_, sizeof(write_ack_)),
+            [this, self](const asio::error_code& ec, std::size_t len) {
+                bool complete = !ec && len == sizeof(write_ack_) &&
+                                write_ack_ == kWriteAck;
+                if (!complete) {
+                    LOG(ERROR) << "ClientSession::readWriteAck failed: "
+                               << ec.message() << ", bytes=" << len;
+                    asio::error_code ignored;
+                    socket_->close(ignored);
+                }
+                if (on_finalize_) {
+                    on_finalize_(complete ? TransferStatusEnum::COMPLETED
+                                          : TransferStatusEnum::FAILED);
+                }
+                session_mutex_.unlock();
+                if (on_complete_) on_complete_();
+            });
+    }
+
     void writeBody() {
         auto self(shared_from_this());
         uint64_t size = le64toh(header_.size);
@@ -355,9 +396,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         size_t buffer_size =
             std::min(kDefaultBufferSize, size - total_transferred_bytes_);
         if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            if (on_complete_) on_complete_();
+            readWriteAck();
             return;
         }
 

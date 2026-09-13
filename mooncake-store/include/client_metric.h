@@ -1,6 +1,10 @@
 #pragma once
 
+#include <array>
 #include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include <vector>
@@ -43,6 +47,52 @@ const inline std::map<std::string, std::string> merge_labels(
     merged_labels.insert(labels.begin(), labels.end());
     return merged_labels;
 }
+
+enum class StorageIOKind { DRAM_READ, DRAM_WRITE, SSD_READ, SSD_WRITE };
+
+struct StorageIOCounters {
+    uint64_t bytes = 0;
+    uint64_t ops = 0;
+    uint64_t errors = 0;
+};
+
+struct StorageIOSnapshot {
+    bool enabled = false;
+    int64_t sampled_at_ns = 0;
+    std::array<StorageIOCounters, 4> totals{};
+    uint64_t window_id = 0;
+    bool window_active = false;
+    int64_t window_start_ns = 0;
+    int64_t window_end_ns = 0;
+    std::array<StorageIOCounters, 4> window{};
+    std::array<uint64_t, 4> peak_window_bytes{};
+};
+
+class StorageIOMetric {
+   public:
+    using Clock = int64_t (*)();
+    static constexpr int64_t kWindowNs = 100000000;
+    static int64_t MonotonicNs();
+    static StorageIOMetric& Instance();
+
+    explicit StorageIOMetric(bool enabled = true, Clock clock = MonotonicNs)
+        : enabled_(enabled), clock_(clock) {}
+    void Record(StorageIOKind kind, uint64_t bytes, uint64_t ops,
+                uint64_t errors = 0);
+    std::optional<uint64_t> BeginWindow();
+    bool EndWindow(uint64_t window_id);
+    StorageIOSnapshot Snapshot();
+    std::string SnapshotJson();
+    void Serialize(std::string& output);
+
+   private:
+    const bool enabled_;
+    Clock clock_;
+    std::mutex mutex_;
+    StorageIOSnapshot state_;
+    uint64_t bucket_index_ = 0;
+    std::array<uint64_t, 4> bucket_bytes_{};
+};
 
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})

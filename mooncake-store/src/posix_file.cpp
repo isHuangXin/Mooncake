@@ -32,6 +32,16 @@ PosixFile::~PosixFile() {
     fd_ = -1;
 }
 
+tl::expected<void, ErrorCode> PosixFile::datasync() {
+    if (fd_ < 0) return make_error<void>(ErrorCode::FILE_NOT_FOUND);
+    int result;
+    do {
+        result = ::fdatasync(fd_);
+    } while (result < 0 && errno == EINTR);
+    if (result < 0) return make_error<void>(ErrorCode::FILE_WRITE_FAIL);
+    return {};
+}
+
 tl::expected<size_t, ErrorCode> PosixFile::write(const std::string &buffer,
                                                  size_t length) {
     return write(std::span<const char>(buffer.data(), length), length);

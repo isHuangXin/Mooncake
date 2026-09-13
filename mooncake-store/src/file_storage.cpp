@@ -197,6 +197,21 @@ FileStorage::~FileStorage() {
     }
 }
 
+tl::expected<OffloadMetadata, ErrorCode> FileStorage::GetStoreMetadata() {
+    auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return bucket->GetStoreMetadata();
+}
+
+bool FileStorage::SupportsNativeIOMetrics() const {
+#ifdef USE_URING
+    return config_.use_uring &&
+           std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_) != nullptr;
+#else
+    return false;
+#endif
+}
+
 tl::expected<void, ErrorCode> FileStorage::Init() {
     auto register_memory_result = RegisterLocalMemory();
     if (!register_memory_result) {

@@ -173,6 +173,26 @@ TEST_F(PosixFileTest, FileLocking) {
     }
 }
 
+TEST_F(PosixFileTest, DataSyncAfterWrite) {
+    PosixFile file(test_filename, test_fd);
+    std::string data = "persisted bucket data";
+    ASSERT_TRUE(file.write(data, data.size()));
+    EXPECT_TRUE(file.datasync());
+    std::string actual(data.size(), char{});
+    ASSERT_EQ(pread(test_fd, actual.data(), actual.size(), 0),
+              static_cast<ssize_t>(data.size()));
+    EXPECT_EQ(actual, data);
+}
+
+TEST_F(PosixFileTest, DataSyncFailureIsNotSuccessfulPersistence) {
+    PosixFile file(test_filename, test_fd);
+    ASSERT_EQ(close(test_fd), 0);
+    test_fd = -1;
+    auto result = file.datasync();
+    ASSERT_FALSE(result);
+    EXPECT_EQ(result.error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {

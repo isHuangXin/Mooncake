@@ -160,6 +160,7 @@ class PosixFile : public StorageFile {
    public:
     PosixFile(const std::string &filename, int fd);
     ~PosixFile() override;
+    tl::expected<void, ErrorCode> datasync();
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
                                           size_t length) override;
@@ -234,6 +235,7 @@ class UringFile : public StorageFile {
 
    private:
     bool use_direct_io_;
+    bool track_bucket_reads_;
     static constexpr size_t ALIGNMENT_ = 4096;
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.

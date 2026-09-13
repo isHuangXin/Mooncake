@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "client_metric.h"
 
 #include <fcntl.h>
 #include <unistd.h>
@@ -1988,11 +1989,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         auto write_result =
             uring_file->write_aligned(write_buffer, aligned_size, 0);
         if (!write_result) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
             LOG(ERROR) << "write_aligned failed for: " << bucket_id
                        << ", error: " << write_result.error();
             return tl::make_unexpected(write_result.error());
         }
         if (write_result.value() != aligned_size) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
             LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                        << ", expected: " << aligned_size
                        << ", got: " << write_result.value();
@@ -2004,9 +2007,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         // incomplete data (write-ordering durability guarantee).
         auto sync_result = uring_file->datasync();
         if (!sync_result) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
             LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
+        StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE,
+                                           write_result.value(), 1);
 
         // Invalidate cache for this file since content changed
         {
@@ -2019,17 +2025,28 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         // Fallback to vector_write for non-UringFile
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
             LOG(ERROR) << "vector_write failed for: " << bucket_id
                        << ", error: " << write_result.error();
             return tl::make_unexpected(write_result.error());
         }
         if (static_cast<int64_t>(write_result.value()) !=
             bucket_metadata->data_size) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
             LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                        << ", expected: " << bucket_metadata->data_size
                        << ", got: " << write_result.value();
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
+        // OpenFile returns PosixFile for write-mode handles.
+        auto sync_result = static_cast<PosixFile*>(file.get())->datasync();
+        if (!sync_result) {
+            StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(sync_result.error());
+        }
+        StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE,
+                                           write_result.value(), 1);
 
         // Invalidate cache for this file since content changed
         {

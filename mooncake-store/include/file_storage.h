@@ -13,6 +13,8 @@ class FileStorage {
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+    tl::expected<OffloadMetadata, ErrorCode> GetStoreMetadata();
+    bool SupportsNativeIOMetrics() const;
 
     /**
      * @brief Result of BatchGet operation containing batch_id and buffer

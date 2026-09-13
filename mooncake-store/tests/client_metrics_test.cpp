@@ -267,4 +267,81 @@ TEST_F(ClientMetricsTest, SerializeWithoutDynamicLabels) {
     }
 }
 
+TEST_F(ClientMetricsTest, StorageWindowUsesCompletedBucketsWithoutResettingTotals) {
+    static int64_t now = 1000000000;
+    now = 1000000000;
+    StorageIOMetric metric(true, [] { return now; });
+    metric.Record(StorageIOKind::SSD_WRITE, 9000, 1);
+    auto id = metric.BeginWindow();
+    ASSERT_TRUE(id.has_value());
+    EXPECT_FALSE(metric.BeginWindow().has_value());
+    metric.Record(StorageIOKind::SSD_WRITE, 1000, 1);
+    now += 99000000;
+    metric.Record(StorageIOKind::SSD_WRITE, 2000, 1);
+    now += 1000000;
+    metric.Record(StorageIOKind::SSD_WRITE, 2500, 1);
+    now += 400000000;
+    metric.Record(StorageIOKind::SSD_WRITE, 0, 0, 1);
+    auto snapshot = metric.Snapshot();
+    EXPECT_EQ(snapshot.window[3].bytes, 5500);
+    EXPECT_EQ(snapshot.window[3].ops, 3);
+    EXPECT_EQ(snapshot.window[3].errors, 1);
+    EXPECT_EQ(snapshot.peak_window_bytes[3], 3000);
+    EXPECT_EQ(snapshot.totals[3].bytes, 14500);
+    EXPECT_EQ(metric.Snapshot().totals[3].bytes, 14500);
+    EXPECT_FALSE(metric.EndWindow(*id + 1));
+    EXPECT_TRUE(metric.EndWindow(*id));
+    EXPECT_FALSE(metric.EndWindow(*id));
+    metric.Record(StorageIOKind::SSD_WRITE, 500, 1);
+    EXPECT_EQ(metric.Snapshot().window[3].bytes, 5500);
+    EXPECT_EQ(metric.Snapshot().totals[3].bytes, 15000);
+    auto next = metric.BeginWindow();
+    ASSERT_TRUE(next.has_value());
+    EXPECT_EQ(*next, *id + 1);
+    EXPECT_EQ(metric.Snapshot().peak_window_bytes[3], 0);
+    EXPECT_EQ(metric.Snapshot().totals[3].bytes, 15000);
+    EXPECT_TRUE(metric.EndWindow(*next));
+}
+
+TEST_F(ClientMetricsTest, StorageWindowAggregatesThreadsAndKeepsDirectionsSeparate) {
+    static int64_t now = 2000000000;
+    now = 2000000000;
+    StorageIOMetric metric(true, [] { return now; });
+    auto id = metric.BeginWindow();
+    ASSERT_TRUE(id.has_value());
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i) {
+        workers.emplace_back([&metric] {
+            for (int j = 0; j < 100; ++j) {
+                metric.Record(StorageIOKind::SSD_READ, 4096, 1);
+                metric.Record(StorageIOKind::DRAM_READ, 2048, 1);
+            }
+        });
+    }
+    for (auto& worker : workers) worker.join();
+    now += 20000000;
+    ASSERT_TRUE(metric.EndWindow(*id));
+    auto snapshot = metric.Snapshot();
+    EXPECT_EQ(snapshot.window[2].ops, 400);
+    EXPECT_EQ(snapshot.peak_window_bytes[2], 400 * 4096);
+    EXPECT_EQ(snapshot.window[0].bytes, 400 * 2048);
+    EXPECT_EQ(snapshot.window[1].bytes, 0);
+    EXPECT_EQ(snapshot.window[3].bytes, 0);
+    EXPECT_EQ(snapshot.window_end_ns - snapshot.window_start_ns, 20000000);
+    const auto json = metric.SnapshotJson();
+    EXPECT_NE(json.find("\"bucket_ns\":100000000"), std::string::npos);
+    EXPECT_NE(json.find("\"active\":false"), std::string::npos);
+    std::string prometheus;
+    metric.Serialize(prometheus);
+    EXPECT_NE(prometheus.find("mooncake_storage_io_completed_bytes_total{path=\"ssd_read\"} 1638400"), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, DisabledStorageMetricsAreNotEmptyValidMeasurements) {
+    StorageIOMetric metric(false);
+    metric.Record(StorageIOKind::SSD_READ, 4096, 1);
+    EXPECT_FALSE(metric.BeginWindow().has_value());
+    EXPECT_FALSE(metric.Snapshot().enabled);
+    EXPECT_EQ(metric.Snapshot().totals[2].bytes, 0);
+}
+
 }  // namespace mooncake::test

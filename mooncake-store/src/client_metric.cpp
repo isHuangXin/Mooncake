@@ -5,7 +5,9 @@
 #include <cctype>
 #include <chrono>
 #include <cstdlib>
+#include <iomanip>
 #include <thread>
+#include <unistd.h>
 
 namespace mooncake {
 
@@ -54,6 +56,135 @@ uint64_t parseMetricsInterval() {
 
 }  // anonymous namespace
 
+int64_t StorageIOMetric::MonotonicNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+}
+
+StorageIOMetric& StorageIOMetric::Instance() {
+    // Native client shutdown can finish I/O from atexit handlers.
+    static auto* metric = new StorageIOMetric(parseMetricsEnabled());
+    return *metric;
+}
+
+void StorageIOMetric::Record(StorageIOKind kind, uint64_t bytes, uint64_t ops,
+                             uint64_t errors) {
+    if (!enabled_) return;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const auto index = static_cast<size_t>(kind);
+    auto& total = state_.totals[index];
+    total.bytes += bytes;
+    total.ops += ops;
+    total.errors += errors;
+    if (!state_.window_active) return;
+    const auto bucket = static_cast<uint64_t>(
+        (clock_() - state_.window_start_ns) / kWindowNs);
+    if (bucket != bucket_index_) {
+        bucket_index_ = bucket;
+        bucket_bytes_.fill(0);
+    }
+    auto& window = state_.window[index];
+    window.bytes += bytes;
+    window.ops += ops;
+    window.errors += errors;
+    bucket_bytes_[index] += bytes;
+    state_.peak_window_bytes[index] =
+        std::max(state_.peak_window_bytes[index], bucket_bytes_[index]);
+}
+
+std::optional<uint64_t> StorageIOMetric::BeginWindow() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_ || state_.window_active) return std::nullopt;
+    ++state_.window_id;
+    state_.window_active = true;
+    state_.window_start_ns = clock_();
+    state_.window_end_ns = 0;
+    state_.window = {};
+    state_.peak_window_bytes.fill(0);
+    bucket_index_ = 0;
+    bucket_bytes_.fill(0);
+    return state_.window_id;
+}
+
+bool StorageIOMetric::EndWindow(uint64_t window_id) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!state_.window_active || state_.window_id != window_id) return false;
+    state_.window_end_ns = clock_();
+    state_.window_active = false;
+    return true;
+}
+
+StorageIOSnapshot StorageIOMetric::Snapshot() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto result = state_;
+    result.enabled = enabled_;
+    result.sampled_at_ns = clock_();
+    return result;
+}
+
+namespace {
+constexpr std::array<const char*, 4> kStorageIONames = {
+    "dram_read", "dram_write", "ssd_read", "ssd_write"};
+
+void WriteIOCounters(std::ostream& out,
+                     const std::array<StorageIOCounters, 4>& counters) {
+    out << '{';
+    for (size_t i = 0; i < counters.size(); ++i) {
+        if (i) out << ',';
+        out << '"' << kStorageIONames[i] << "\":{\"bytes\":"
+            << counters[i].bytes << ",\"ops\":" << counters[i].ops
+            << ",\"errors\":" << counters[i].errors << '}';
+    }
+    out << '}';
+}
+}  // namespace
+
+std::string StorageIOMetric::SnapshotJson() {
+    const auto value = Snapshot();
+    std::ostringstream out;
+    out << std::boolalpha << std::setprecision(17)
+        << "{\"schema_version\":1,\"pid\":" << getpid()
+        << ",\"enabled\":" << value.enabled
+        << ",\"sampled_at_ns\":" << value.sampled_at_ns << ",\"totals\":";
+    WriteIOCounters(out, value.totals);
+    out << ",\"window\":{\"id\":" << value.window_id
+        << ",\"active\":" << value.window_active
+        << ",\"start_ns\":" << value.window_start_ns
+        << ",\"end_ns\":" << value.window_end_ns
+        << ",\"bucket_ns\":" << kWindowNs << ",\"counters\":";
+    WriteIOCounters(out, value.window);
+    out << ",\"peak_window_bytes\":{";
+    for (size_t i = 0; i < kStorageIONames.size(); ++i) {
+        if (i) out << ',';
+        out << '"' << kStorageIONames[i] << "\":" << value.peak_window_bytes[i];
+    }
+    out << "}}}";
+    return out.str();
+}
+
+void StorageIOMetric::Serialize(std::string& output) {
+    const auto value = Snapshot();
+    std::ostringstream out;
+    for (const auto* field : {"bytes", "ops", "errors"}) {
+        out << "# TYPE mooncake_storage_io_completed_" << field
+            << "_total counter\n";
+    }
+    out << "# TYPE mooncake_storage_io_peak_100ms_bytes gauge\n";
+    for (size_t i = 0; i < kStorageIONames.size(); ++i) {
+        const auto labels = std::string("{path=\"") + kStorageIONames[i] + "\"} ";
+        out << "mooncake_storage_io_completed_bytes_total" << labels
+            << value.totals[i].bytes << '\n'
+            << "mooncake_storage_io_completed_ops_total" << labels
+            << value.totals[i].ops << '\n'
+            << "mooncake_storage_io_completed_errors_total" << labels
+            << value.totals[i].errors << '\n'
+            << "mooncake_storage_io_peak_100ms_bytes" << labels
+            << value.peak_window_bytes[i] << '\n';
+    }
+    output += out.str();
+}
+
 ClientMetric::ClientMetric(uint64_t interval_seconds,
                            const std::map<std::string, std::string>& labels)
     : transfer_metric(labels),
@@ -85,6 +216,7 @@ std::unique_ptr<ClientMetric> ClientMetric::Create(
 void ClientMetric::serialize(std::string& str) {
     transfer_metric.serialize(str);
     master_client_metric.serialize(str);
+    StorageIOMetric::Instance().Serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {

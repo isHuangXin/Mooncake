@@ -13,6 +13,7 @@
 #include <cstdlib>  // for atexit
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <optional>
 #include <vector>
 
@@ -634,6 +635,23 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
+std::string RealClient::get_storage_io_stats() {
+    auto output = StorageIOMetric::Instance().SnapshotJson();
+    output.pop_back();
+    const bool available = file_storage_ && file_storage_->SupportsNativeIOMetrics();
+    output += std::string(",\"ssd_io_available\":") + (available ? "true" : "false");
+    auto metadata = file_storage_
+        ? file_storage_->GetStoreMetadata()
+        : tl::expected<OffloadMetadata, ErrorCode>(
+              tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+    output += ",\"ssd_used_bytes\":" +
+              (metadata ? std::to_string(metadata->total_size) : "null");
+    output += ",\"ssd_keys\":" +
+              (metadata ? std::to_string(metadata->total_keys) : "null");
+    output += ",\"ssd_usage_scope\":\"bucket metadata bytes, not allocated filesystem blocks\"}";
+    return output;
+}
+
 int RealClient::start_http_server() {
     using namespace coro_http;
 
@@ -682,6 +700,66 @@ int RealClient::start_http_server() {
             }
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, std::move(*result));
+        });
+
+    http_server_->set_http_handler<GET>(
+        "/storage_io", [this](coro_http_request &req, coro_http_response &resp) {
+            if (!client_) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "client not initialized");
+                return;
+            }
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, get_storage_io_stats());
+        });
+    http_server_->set_http_handler<POST>(
+        "/storage_io/begin", [this](coro_http_request &req, coro_http_response &resp) {
+            auto& metric = StorageIOMetric::Instance();
+            if (!file_storage_ || !file_storage_->SupportsNativeIOMetrics() ||
+                !metric.Snapshot().enabled) {
+                resp.set_status_and_content(status_type::service_unavailable,
+                                            "native bucket io_uring metrics not available");
+                return;
+            }
+            if (!metric.BeginWindow()) {
+                resp.set_status_and_content(status_type::conflict,
+                                            "an I/O measurement window is already active");
+                return;
+            }
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, get_storage_io_stats());
+        });
+    http_server_->set_http_handler<POST>(
+        "/storage_io/end", [this](coro_http_request &req, coro_http_response &resp) {
+            auto raw = req.get_query_value("window_id");
+            uint64_t window_id = 0;
+            if (raw.empty()) {
+                resp.set_status_and_content(status_type::bad_request, "missing window_id");
+                return;
+            }
+            auto parsed = std::from_chars(raw.data(), raw.data() + raw.size(), window_id);
+            if (parsed.ec != std::errc{} || parsed.ptr != raw.data() + raw.size()) {
+                resp.set_status_and_content(status_type::bad_request, "invalid window_id");
+                return;
+            }
+            auto raw_pid = req.get_query_value("pid");
+            uint64_t owner_pid = 0;
+            if (raw_pid.empty()) {
+                resp.set_status_and_content(status_type::bad_request, "missing pid");
+                return;
+            }
+            auto parsed_pid = std::from_chars(raw_pid.data(), raw_pid.data() + raw_pid.size(), owner_pid);
+            if (parsed_pid.ec != std::errc{} || parsed_pid.ptr != raw_pid.data() + raw_pid.size() ||
+                owner_pid != static_cast<uint64_t>(getpid())) {
+                resp.set_status_and_content(status_type::conflict, "I/O owner does not match");
+                return;
+            }
+            if (!StorageIOMetric::Instance().EndWindow(window_id)) {
+                resp.set_status_and_content(status_type::conflict, "I/O window does not match");
+                return;
+            }
+            resp.add_header("Content-Type", "application/json");
+            resp.set_status_and_content(status_type::ok, get_storage_io_stats());
         });
 
     http_server_->set_http_handler<GET>(

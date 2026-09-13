@@ -160,6 +160,37 @@ TEST_F(TransferTaskTest, TransferStrategyEnum) {
     EXPECT_EQ(oss.str(), "TRANSFER_ENGINE");
 }
 
+TEST_F(TransferTaskTest, StorageCountersWaitForSuccessfulCompletionExactlyOnce) {
+    const auto before = StorageIOMetric::Instance().Snapshot();
+    auto state = std::make_shared<MemcpyOperationState>();
+    state->ConfigureStorageIO(StorageIOKind::DRAM_WRITE, 4096, 2);
+    TransferFuture original(state);
+    TransferFuture moved(std::move(original));
+    EXPECT_EQ(StorageIOMetric::Instance().Snapshot().totals[1].bytes,
+              before.totals[1].bytes);
+    EXPECT_FALSE(moved.isReady());
+    state->set_completed(ErrorCode::OK);
+    EXPECT_TRUE(moved.isReady());
+    EXPECT_EQ(moved.get(), ErrorCode::OK);
+    EXPECT_EQ(moved.get(), ErrorCode::OK);
+    const auto after = StorageIOMetric::Instance().Snapshot();
+    EXPECT_EQ(after.totals[1].bytes - before.totals[1].bytes, 4096);
+    EXPECT_EQ(after.totals[1].ops - before.totals[1].ops, 2);
+}
+
+TEST_F(TransferTaskTest, FailedAndFileTransfersDoNotBecomeSuccessfulDramReads) {
+    const auto before = StorageIOMetric::Instance().Snapshot();
+    auto failed = std::make_shared<MemcpyOperationState>();
+    failed->ConfigureStorageIO(StorageIOKind::DRAM_READ, 4096, 1);
+    failed->set_completed(ErrorCode::TRANSFER_FAIL);
+    auto file = std::make_shared<FilereadOperationState>();
+    file->set_completed(ErrorCode::OK);
+    const auto after = StorageIOMetric::Instance().Snapshot();
+    EXPECT_EQ(after.totals[0].bytes, before.totals[0].bytes);
+    EXPECT_EQ(after.totals[0].ops, before.totals[0].ops);
+    EXPECT_EQ(after.totals[0].errors - before.totals[0].errors, 1);
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
