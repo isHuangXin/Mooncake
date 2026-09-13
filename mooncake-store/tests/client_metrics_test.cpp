@@ -656,6 +656,88 @@ TEST_F(ClientMetricsTest,
               std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, AlignedBucketsUseCompletionTimeAndKeepWarmupOutside) {
+    static int64_t now = 1000000000;
+    now = 1000000000;
+    StorageIOMetric metric(true, [] { return now; });
+    metric.Record(StorageIOKind::SSD_READ, 900, 1);
+    ASSERT_TRUE(metric.BeginWindow(123, now, true));
+    EXPECT_TRUE(metric.BeginWindow(123, now, true));
+    EXPECT_FALSE(metric.BeginWindow(124, now, true));
+    now = 1250000000;
+    metric.Record(StorageIOKind::SSD_READ, 20, 1, 0, 1100000000);
+    metric.Record(StorageIOKind::SSD_READ, 10, 1, 0, 1099999999);
+    metric.Record(StorageIOKind::SSD_READ, 5, 1, 0, 1000000001);
+    metric.Record(StorageIOKind::SSD_READ, 99, 1, 0, 999999999);
+    metric.Record(StorageIOKind::SSD_READ, 0, 0, 2);
+    EXPECT_FALSE(metric.EndWindow(124, now, false));
+    EXPECT_FALSE(metric.EndWindow(123, 1099999999, false));
+    ASSERT_TRUE(metric.EndWindow(123, now, false));
+    auto snapshot = metric.Snapshot();
+    ASSERT_EQ(snapshot.buckets.size(), 2);
+    EXPECT_EQ(snapshot.buckets[0].index, 0);
+    EXPECT_EQ(snapshot.buckets[0].bytes[2], 15);
+    EXPECT_EQ(snapshot.buckets[1].index, 1);
+    EXPECT_EQ(snapshot.buckets[1].bytes[2], 20);
+    EXPECT_EQ(snapshot.window[2].bytes, 35);
+    EXPECT_EQ(snapshot.window[2].ops, 3);
+    EXPECT_EQ(snapshot.window[2].errors, 2);
+    EXPECT_EQ(snapshot.totals[2].bytes, 1034);
+    EXPECT_EQ(snapshot.peak_window_bytes[2], 20);
+    EXPECT_TRUE(metric.EndWindow(123, now + 1, false));
+    EXPECT_EQ(metric.Snapshot().window_end_ns, now);
+    EXPECT_FALSE(metric.BeginWindow(123, now, true));
+    metric.Record(StorageIOKind::SSD_READ, 500, 1);
+    EXPECT_EQ(metric.Snapshot().window[2].bytes, 35);
+    EXPECT_EQ(metric.Snapshot().totals[2].bytes, 1534);
+    EXPECT_NE(metric.SnapshotJson().find("\"capture_buckets\":true"), std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, AlignedWindowsAbortAndBoundBucketHistory) {
+    static int64_t now = 1000000000;
+    now = 1000000000;
+    StorageIOMetric metric(true, [] { return now; });
+    EXPECT_FALSE(metric.BeginWindow(0, now, true));
+    EXPECT_FALSE(metric.BeginWindow(1, now + 1, true));
+    ASSERT_TRUE(metric.BeginWindow(1, now, true));
+    now += StorageIOMetric::kWindowNs * StorageIOMetric::kMaxBuckets;
+    metric.Record(StorageIOKind::SSD_READ, 100, 1);
+    EXPECT_TRUE(metric.Snapshot().window_overflowed);
+    EXPECT_TRUE(metric.Snapshot().buckets.empty());
+    EXPECT_EQ(metric.Snapshot().window[2].bytes, 100);
+    ASSERT_TRUE(metric.EndWindow(1, now, true));
+    EXPECT_TRUE(metric.Snapshot().window_aborted);
+    ASSERT_TRUE(metric.BeginWindow(2, now, true));
+    EXPECT_FALSE(metric.Snapshot().window_aborted);
+    EXPECT_FALSE(metric.Snapshot().window_overflowed);
+    EXPECT_EQ(metric.Snapshot().totals[2].bytes, 100);
+    EXPECT_EQ(metric.Snapshot().window[2].bytes, 0);
+    now += 1000000;
+    EXPECT_TRUE(metric.EndWindow(2, now, false));
+    EXPECT_FALSE(metric.EndWindow(1, now, true));
+    EXPECT_FALSE(metric.Snapshot().window_aborted);
+}
+
+TEST_F(ClientMetricsTest, AlignedBucketsAggregateConcurrentCompletions) {
+    static int64_t now = 1000000000;
+    now = 1000000000;
+    StorageIOMetric metric(true, [] { return now; });
+    ASSERT_TRUE(metric.BeginWindow(7, now, true));
+    now += 200000000;
+    std::vector<std::thread> workers;
+    for (int i = 0; i < 4; ++i) workers.emplace_back([&metric, i] {
+        for (int j = 0; j < 100; ++j)
+            metric.Record(StorageIOKind::SSD_READ, 4096, 1, 0, 1000000000 + (i % 2) * 100000000);
+    });
+    for (auto& worker : workers) worker.join();
+    ASSERT_TRUE(metric.EndWindow(7, now, false));
+    auto snapshot = metric.Snapshot();
+    ASSERT_EQ(snapshot.buckets.size(), 2);
+    EXPECT_EQ(snapshot.buckets[0].bytes[2], 200 * 4096);
+    EXPECT_EQ(snapshot.buckets[1].bytes[2], 200 * 4096);
+    EXPECT_EQ(snapshot.window[2].ops, 400);
+}
+
 TEST_F(ClientMetricsTest, DisabledStorageMetricsAreNotEmptyValidMeasurements) {
     StorageIOMetric metric(false);
     metric.Record(StorageIOKind::SSD_READ, 4096, 1);

@@ -83,6 +83,9 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    tl::expected<LocalFileReadBatch, ErrorCode> AcquireLocalReads(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes);
+
     FileStorageConfig config_;
 
     /**
@@ -99,6 +102,7 @@ class FileStorage {
     struct AllocatedBatch {
         uint64_t batch_id;
         std::vector<BufferHandle> handles;
+        std::vector<BucketReadGuard> bucket_guards;
         std::unordered_map<std::string, Slice> slices;
         std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;

@@ -1899,6 +1899,47 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     return {};
 }
 
+tl::expected<std::vector<LocalFileRead>, ErrorCode>
+BucketStorageBackend::AcquireLocalReads(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+    std::vector<BucketReadGuard>& guards) {
+    if (keys.size() != sizes.size() || keys.size() > 4096) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<LocalFileRead> files(keys.size());
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto object = object_bucket_map_.find(keys[i]);
+        if (object == object_bucket_map_.end()) continue;
+        const auto& meta = object->second;
+        auto bucket = buckets_.find(meta.bucket_id);
+        if (bucket == buckets_.end() || meta.data_size != sizes[i] ||
+            sizes[i] <= 0 || meta.offset < 0 || meta.key_size < 0) continue;
+        guards.emplace_back(bucket->second);
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::LRU) {
+            auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket->second->last_access_ns_.store(now, std::memory_order_relaxed);
+        }
+        auto path = GetBucketDataPath(meta.bucket_id);
+        if (!path) continue;
+        std::error_code error;
+        auto absolute = std::filesystem::canonical(*path, error);
+        struct stat st {};
+        if (error || ::stat(absolute.c_str(), &st) != 0 ||
+            !S_ISREG(st.st_mode) || st.st_size < 0) continue;
+        uint64_t offset = static_cast<uint64_t>(meta.offset) + meta.key_size;
+        if (offset > static_cast<uint64_t>(st.st_size) ||
+            static_cast<uint64_t>(sizes[i]) > st.st_size - offset) continue;
+        files[i] = {absolute.string(), offset, static_cast<uint64_t>(sizes[i]),
+                    static_cast<uint64_t>(st.st_size),
+                    static_cast<uint64_t>(st.st_dev),
+                    static_cast<uint64_t>(st.st_ino), st.st_mtim.tv_sec,
+                    st.st_mtim.tv_nsec};
+    }
+    return files;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     // Step 1: Build read plan by copying metadata under lock

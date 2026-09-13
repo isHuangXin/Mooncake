@@ -85,6 +85,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    gds_reader.cpp
     config/file_storage_config.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
@@ -494,6 +495,23 @@ if(CUDAToolkit_FOUND)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
 elseif(hip_FOUND)
   target_link_libraries(mooncake_store PRIVATE hip::host)
+endif()
+
+if(STORE_USE_GDS)
+  if(NOT USE_CUDA)
+    message(FATAL_ERROR "STORE_USE_GDS requires USE_CUDA")
+  endif()
+  find_package(CUDAToolkit REQUIRED)
+  find_path(CUFILE_INCLUDE_DIR cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS} REQUIRED)
+  find_library(
+    CUFILE_LIBRARY cufile
+    HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_ROOT}/lib64
+    REQUIRED)
+  # FLAT_MEMORY: client sources are compiled by the v0.3.13 object library.
+  target_compile_definitions(mooncake_store_client_objects PRIVATE STORE_USE_GDS)
+  target_include_directories(mooncake_store_client_objects
+                             PRIVATE ${CUFILE_INCLUDE_DIR})
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart ${CUFILE_LIBRARY})
 endif()
 if(USE_ASCEND
    OR USE_ASCEND_DIRECT

@@ -10,6 +10,7 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
+#include "environ.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
@@ -132,6 +133,26 @@ tl::expected<OffloadMetadata, ErrorCode> FileStorage::GetStoreMetadata() {
     auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
     if (!bucket) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     return bucket->GetStoreMetadata();
+}
+
+tl::expected<LocalFileReadBatch, ErrorCode> FileStorage::AcquireLocalReads(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket || !Environ::GetBool("MOONCAKE_ALLOW_LOCAL_GDS", false)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto batch = std::make_shared<AllocatedBatch>();
+    auto files = bucket->AcquireLocalReads(keys, sizes, batch->bucket_guards);
+    if (!files) return tl::make_unexpected(files.error());
+    MutexLocker lock(&client_buffer_mutex_);
+    if (client_buffer_allocated_batches_.size() >= 1024) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    batch->batch_id = next_batch_id_.fetch_add(1);
+    batch->lease_timeout = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.client_buffer_gc_ttl_ms);
+    client_buffer_allocated_batches_.emplace(batch->batch_id, batch);
+    return LocalFileReadBatch{batch->batch_id, std::move(*files)};
 }
 
 bool FileStorage::SupportsNativeIOMetrics() const {

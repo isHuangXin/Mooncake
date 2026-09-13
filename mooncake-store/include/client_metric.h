@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <mutex>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <thread>
@@ -106,6 +107,11 @@ struct StorageIOCounters {
     uint64_t errors = 0;
 };
 
+struct StorageIOBucket {
+    uint64_t index = 0;
+    std::array<uint64_t, 4> bytes{};
+};
+
 struct StorageIOSnapshot {
     bool enabled = false;
     int64_t sampled_at_ns = 0;
@@ -116,21 +122,28 @@ struct StorageIOSnapshot {
     int64_t window_end_ns = 0;
     std::array<StorageIOCounters, 4> window{};
     std::array<uint64_t, 4> peak_window_bytes{};
+    bool capture_buckets = false;
+    bool window_aborted = false;
+    bool window_overflowed = false;
+    std::vector<StorageIOBucket> buckets;
 };
 
 class StorageIOMetric {
    public:
     using Clock = int64_t (*)();
     static constexpr int64_t kWindowNs = 100000000;
+    static constexpr uint64_t kMaxBuckets = 72000;
     static int64_t MonotonicNs();
     static StorageIOMetric& Instance();
 
     explicit StorageIOMetric(bool enabled = true, Clock clock = MonotonicNs)
         : enabled_(enabled), clock_(clock) {}
     void Record(StorageIOKind kind, uint64_t bytes, uint64_t ops,
-                uint64_t errors = 0);
+                uint64_t errors = 0, int64_t completed_at_ns = 0);
     std::optional<uint64_t> BeginWindow();
+    bool BeginWindow(uint64_t window_id, int64_t start_ns, bool capture_buckets);
     bool EndWindow(uint64_t window_id);
+    bool EndWindow(uint64_t window_id, int64_t end_ns, bool abort);
     StorageIOSnapshot Snapshot();
     std::string SnapshotJson();
     void Serialize(std::string& output);
@@ -142,6 +155,9 @@ class StorageIOMetric {
     StorageIOSnapshot state_;
     uint64_t bucket_index_ = 0;
     std::array<uint64_t, 4> bucket_bytes_{};
+    std::map<uint64_t, std::array<uint64_t, 4>> bucket_history_;
+    int64_t last_completion_ns_ = 0;
+    void StartWindowLocked(uint64_t window_id, int64_t start_ns, bool capture_buckets);
 };
 
 struct TransferMetric {

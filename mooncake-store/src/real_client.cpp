@@ -1113,6 +1113,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
             ->register_handler<&RealClient::release_offload_buffer>(this);
+        // FLAT_MEMORY: expose guarded GDS ranges on the embedded owner RPC.
+        offload_rpc_server_
+            ->register_handler<&RealClient::acquire_local_reads>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -6875,6 +6878,19 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         result.value().batch_id, std::move(result.value().pointers),
         client_->GetSegmentEndpoint(),
         file_storage_->config_.client_buffer_gc_ttl_ms);
+}
+
+tl::expected<LocalFileReadBatch, ErrorCode> RealClient::acquire_local_reads(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
+    if (!file_storage_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return file_storage_->AcquireLocalReads(keys, sizes);
+}
+
+tl::expected<LocalFileReadBatch, ErrorCode> ClientRequester::acquire_local_reads(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes) {
+    return invoke_rpc<&RealClient::acquire_local_reads, LocalFileReadBatch>(
+        client_addr, keys, sizes);
 }
 
 bool RealClient::release_offload_buffer(uint64_t batch_id) {

@@ -78,7 +78,7 @@ StorageIOMetric& StorageIOMetric::Instance() {
 }
 
 void StorageIOMetric::Record(StorageIOKind kind, uint64_t bytes, uint64_t ops,
-                            uint64_t errors) {
+                            uint64_t errors, int64_t completed_at_ns) {
     if (!enabled_) return;
     std::lock_guard<std::mutex> lock(mutex_);
     const auto index = static_cast<size_t>(kind);
@@ -87,33 +87,67 @@ void StorageIOMetric::Record(StorageIOKind kind, uint64_t bytes, uint64_t ops,
     total.ops += ops;
     total.errors += errors;
     if (!state_.window_active) return;
-    const auto bucket = static_cast<uint64_t>(
-        (clock_() - state_.window_start_ns) / kWindowNs);
-    if (bucket != bucket_index_) {
-        bucket_index_ = bucket;
-        bucket_bytes_.fill(0);
-    }
+    const auto now = completed_at_ns ? completed_at_ns : clock_();
+    if (now < state_.window_start_ns) return;
+    last_completion_ns_ = std::max(last_completion_ns_, now);
+    const auto bucket = static_cast<uint64_t>((now - state_.window_start_ns) / kWindowNs);
     auto& window = state_.window[index];
     window.bytes += bytes;
     window.ops += ops;
     window.errors += errors;
-    bucket_bytes_[index] += bytes;
-    state_.peak_window_bytes[index] =
-        std::max(state_.peak_window_bytes[index], bucket_bytes_[index]);
+    if (state_.capture_buckets) {
+        if (bucket >= kMaxBuckets) {
+            state_.window_overflowed = true;
+            return;
+        }
+        if (bytes) {
+            auto& bucket_bytes = bucket_history_[bucket];
+            bucket_bytes[index] += bytes;
+            state_.peak_window_bytes[index] = std::max(state_.peak_window_bytes[index], bucket_bytes[index]);
+        }
+    } else {
+        if (bucket != bucket_index_) {
+            bucket_index_ = bucket;
+            bucket_bytes_.fill(0);
+        }
+        bucket_bytes_[index] += bytes;
+        state_.peak_window_bytes[index] = std::max(state_.peak_window_bytes[index], bucket_bytes_[index]);
+    }
+}
+
+void StorageIOMetric::StartWindowLocked(uint64_t window_id, int64_t start_ns, bool capture_buckets) {
+    state_.window_id = window_id;
+    state_.window_active = true;
+    state_.window_start_ns = start_ns;
+    state_.window_end_ns = 0;
+    state_.window = {};
+    state_.peak_window_bytes.fill(0);
+    state_.capture_buckets = capture_buckets;
+    state_.window_aborted = false;
+    state_.window_overflowed = false;
+    bucket_index_ = 0;
+    bucket_bytes_.fill(0);
+    bucket_history_.clear();
+    last_completion_ns_ = 0;
 }
 
 std::optional<uint64_t> StorageIOMetric::BeginWindow() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!enabled_ || state_.window_active) return std::nullopt;
-    ++state_.window_id;
-    state_.window_active = true;
-    state_.window_start_ns = clock_();
-    state_.window_end_ns = 0;
-    state_.window = {};
-    state_.peak_window_bytes.fill(0);
-    bucket_index_ = 0;
-    bucket_bytes_.fill(0);
+    StartWindowLocked(state_.window_id + 1, clock_(), false);
     return state_.window_id;
+}
+
+bool StorageIOMetric::BeginWindow(uint64_t window_id, int64_t start_ns, bool capture_buckets) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!enabled_ || !window_id || start_ns <= 0 || start_ns > clock_()) return false;
+    if (state_.window_active) {
+        return state_.window_id == window_id && state_.window_start_ns == start_ns &&
+               state_.capture_buckets == capture_buckets;
+    }
+    if (state_.window_id == window_id) return false;
+    StartWindowLocked(window_id, start_ns, capture_buckets);
+    return true;
 }
 
 bool StorageIOMetric::EndWindow(uint64_t window_id) {
@@ -124,11 +158,28 @@ bool StorageIOMetric::EndWindow(uint64_t window_id) {
     return true;
 }
 
+bool StorageIOMetric::EndWindow(uint64_t window_id, int64_t end_ns, bool abort) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!window_id || state_.window_id != window_id) return false;
+    if (!state_.window_active) {
+        if (abort) state_.window_aborted = true;
+        return true;
+    }
+    if (end_ns < state_.window_start_ns || end_ns > clock_() ||
+        (!abort && end_ns < last_completion_ns_)) return false;
+    state_.window_end_ns = end_ns;
+    state_.window_active = false;
+    state_.window_aborted = abort;
+    return true;
+}
+
 StorageIOSnapshot StorageIOMetric::Snapshot() {
     std::lock_guard<std::mutex> lock(mutex_);
     auto result = state_;
     result.enabled = enabled_;
     result.sampled_at_ns = clock_();
+    result.buckets.reserve(bucket_history_.size());
+    for (const auto& [index, bytes] : bucket_history_) result.buckets.push_back({index, bytes});
     return result;
 }
 
@@ -168,7 +219,22 @@ std::string StorageIOMetric::SnapshotJson() {
         if (i) out << ',';
         out << '"' << kStorageIONames[i] << "\":" << value.peak_window_bytes[i];
     }
-    out << "}}}";
+    out << '}';
+    if (value.capture_buckets) {
+        out << ",\"capture_buckets\":true,\"aborted\":" << value.window_aborted
+            << ",\"overflowed\":" << value.window_overflowed << ",\"buckets\":[";
+        bool first = true;
+        for (const auto& bucket : value.buckets) {
+            if (!first) out << ',';
+            first = false;
+            out << "{\"index\":" << bucket.index;
+            for (size_t i = 0; i < kStorageIONames.size(); ++i)
+                out << ",\"" << kStorageIONames[i] << "\":" << bucket.bytes[i];
+            out << '}';
+        }
+        out << ']';
+    }
+    out << "}}";
     return out.str();
 }
 

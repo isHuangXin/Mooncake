@@ -876,6 +876,10 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     ~BucketStorageBackend();
 
+    tl::expected<std::vector<LocalFileRead>, ErrorCode> AcquireLocalReads(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        std::vector<BucketReadGuard>& guards);
+
     /**
      * @brief Offload objects in batches
      * @param batch_object  A map from object key to a list of data slices to be

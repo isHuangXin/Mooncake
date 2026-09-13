@@ -94,6 +94,7 @@ else()
 endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
+option(STORE_USE_GDS "Enable local GDS (compat) GPU reads in Mooncake Store" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/Dependencies.cmake)
 if(WITH_STORE)
