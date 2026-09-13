@@ -495,6 +495,9 @@ class RealClient : public PyClient {
      */
     bool release_offload_buffer(uint64_t batch_id);
 
+    tl::expected<LocalFileReadBatch, ErrorCode> acquire_local_reads(
+        const std::vector<std::string> &keys, const std::vector<int64_t> &sizes);
+
     /**
      * @brief Retrieves multiple stored objects from a remote service.
      * @param target_rpc_service_addr Address of the remote RPC service (e.g.,

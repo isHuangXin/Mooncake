@@ -152,6 +152,41 @@ class StorageBackendTest : public ::testing::Test {
     }
 };
 
+TEST_F(StorageBackendTest, GDSLocalRangesPreservePayloadAndPinBucket) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketStorageBackend backend(config, BucketBackendConfig{});
+    ASSERT_TRUE(backend.Init());
+    std::string key = "unaligned_key";
+    std::string value(5003, 'v');
+    auto offloaded = backend.BatchOffload(
+        {{key, {Slice{value.data(), value.size()}}}},
+        [](const auto&, auto&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offloaded);
+    std::vector<BucketReadGuard> guards;
+    auto result = backend.AcquireLocalReads({key, "missing", key},
+        {static_cast<int64_t>(value.size()), 10, 1}, guards);
+    ASSERT_TRUE(result);
+    ASSERT_EQ(result->size(), 3);
+    const auto& range = result->at(0);
+    EXPECT_EQ(range.offset, key.size());
+    EXPECT_EQ(range.size, value.size());
+    EXPECT_TRUE(result->at(1).path.empty());
+    EXPECT_TRUE(result->at(2).path.empty());
+    ASSERT_FALSE(guards.empty());
+    EXPECT_GT(guards[0].get()->inflight_reads_.load(), 0);
+    int fd = open(range.path.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    std::string loaded(value.size(), '\0');
+    EXPECT_EQ(pread(fd, loaded.data(), loaded.size(), range.offset), loaded.size());
+    close(fd);
+    EXPECT_EQ(loaded, value);
+    auto bucket = guards[0].get();
+    guards.clear();
+    EXPECT_EQ(bucket->inflight_reads_.load(), 0);
+    EXPECT_FALSE(backend.AcquireLocalReads({key}, {}, guards));
+}
+
 TEST_F(StorageBackendTest, StorageBackendAll) {
     std::shared_ptr<SimpleAllocator> client_buffer_allocator =
         std::make_shared<SimpleAllocator>(128 * 1024 * 1024);

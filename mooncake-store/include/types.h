@@ -398,6 +398,25 @@ inline std::ostream& operator<<(std::ostream& os,
     return os;
 }
 
+struct LocalFileRead {
+    std::string path;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    uint64_t file_size = 0;
+    uint64_t device = 0;
+    uint64_t inode = 0;
+    int64_t mtime_sec = 0;
+    int64_t mtime_nsec = 0;
+    YLT_REFL(LocalFileRead, path, offset, size, file_size, device, inode,
+             mtime_sec, mtime_nsec);
+};
+
+struct LocalFileReadBatch {
+    uint64_t batch_id = 0;
+    std::vector<LocalFileRead> files;
+    YLT_REFL(LocalFileReadBatch, batch_id, files);
+};
+
 struct StorageObjectMetadata {
     int64_t bucket_id;
     int64_t offset;

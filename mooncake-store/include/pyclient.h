@@ -62,6 +62,10 @@ class ClientRequester {
    public:
     ClientRequester();
 
+    tl::expected<LocalFileReadBatch, ErrorCode> acquire_local_reads(
+        const std::string &client_addr, const std::vector<std::string> &keys,
+        const std::vector<int64_t> &sizes);
+
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
      * @param client_addr Network address (e.g., "ip:port") of the remote

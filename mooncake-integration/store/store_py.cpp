@@ -5,6 +5,7 @@
 #include "pyclient.h"
 #include "dummy_client.h"
 #include "real_client.h"
+#include "gds_reader.h"
 #include "types.h"
 
 #include <cstdlib>  // for atexit
@@ -251,6 +252,7 @@ class MooncakeStorePyWrapper {
    public:
     std::shared_ptr<PyClient> store_{nullptr};
     bool use_dummy_client_{false};
+    std::shared_ptr<GDSReader> gds_reader_;
 
     MooncakeStorePyWrapper() = default;
 
@@ -1412,11 +1414,57 @@ PYBIND11_MODULE(store, m) {
         .def("close",
              [](MooncakeStorePyWrapper &self) {
                  if (!self.store_) return 0;
+                 self.gds_reader_.reset();
                  int rc = self.store_->tearDownAll();
                  self.store_.reset();
                  return rc;
              })
         .def("get_storage_io_stats", &MooncakeStorePyWrapper::get_storage_io_stats)
+        .def("enable_gds", [](MooncakeStorePyWrapper &self, const std::string &root,
+                              int device, size_t max_io_bytes) {
+            if (!self.is_client_initialized() || self.use_dummy_client_ || self.gds_reader_)
+                throw std::runtime_error("GDS requires an initialized RealClient without an active reader");
+            py::gil_scoped_release release;
+            self.gds_reader_ = std::make_shared<GDSReader>(root, device, max_io_bytes);
+        }, py::arg("root"), py::arg("device"), py::arg("max_io_bytes") = 16777216)
+        .def("batch_get_into_gpu", [](MooncakeStorePyWrapper &self,
+            const std::vector<std::string> &keys,
+            const std::vector<uintptr_t> &destinations, const std::vector<size_t> &sizes) {
+            auto reader = self.gds_reader_;
+            auto store = self.store_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            return reader->Read(store, keys, destinations, sizes);
+        }, py::arg("keys"), py::arg("destinations"), py::arg("sizes"))
+        .def("begin_gds_io_window", [](MooncakeStorePyWrapper &self, uint64_t id, int64_t start_ns) {
+            auto reader = self.gds_reader_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            return reader->BeginIOWindow(id, start_ns);
+        }, py::arg("window_id"), py::arg("start_ns"))
+        .def("end_gds_io_window", [](MooncakeStorePyWrapper &self, uint64_t id, int64_t end_ns, bool abort) {
+            auto reader = self.gds_reader_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            return reader->EndIOWindow(id, end_ns, abort);
+        }, py::arg("window_id"), py::arg("end_ns"), py::arg("abort") = false)
+        .def("get_gds_io_window", [](MooncakeStorePyWrapper &self) {
+            auto reader = self.gds_reader_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            std::string snapshot;
+            {
+                py::gil_scoped_release release;
+                snapshot = reader->IOWindow();
+            }
+            return py::module_::import("json").attr("loads")(snapshot);
+        })
+        .def_static("gds_io_clock_ns", &GDSReader::IOClockNs)
+        .def("get_gds_stats", [](MooncakeStorePyWrapper &self) {
+            auto reader = self.gds_reader_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            return reader->Stats();
+        })
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

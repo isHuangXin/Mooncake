@@ -26,6 +26,7 @@ set(MOONCAKE_STORE_SOURCES
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    gds_reader.cpp
     serialize/serializer.cpp
     serialize/serializer_backend.cpp
     utils/type_util.cpp
@@ -132,6 +133,18 @@ target_link_libraries(
   PRIVATE transfer_engine)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+
+if(STORE_USE_GDS)
+  if(NOT USE_CUDA)
+    message(FATAL_ERROR "STORE_USE_GDS requires USE_CUDA")
+  endif()
+  find_package(CUDAToolkit REQUIRED)
+  find_path(CUFILE_INCLUDE_DIR cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS} REQUIRED)
+  find_library(CUFILE_LIBRARY cufile HINTS ${CUDAToolkit_LIBRARY_DIR} ${CUDAToolkit_LIBRARY_ROOT}/lib64 REQUIRED)
+  target_compile_definitions(mooncake_store PRIVATE STORE_USE_GDS)
+  target_include_directories(mooncake_store PRIVATE ${CUFILE_INCLUDE_DIR})
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart ${CUFILE_LIBRARY})
 endif()
 
 if(URING_LIB AND URING_INCLUDE)

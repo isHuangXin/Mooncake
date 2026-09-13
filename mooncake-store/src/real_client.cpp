@@ -2789,6 +2789,19 @@ RealClient::batch_get_offload_object(const std::vector<std::string> &keys,
         file_storage_->config_.client_buffer_gc_ttl_ms);
 }
 
+tl::expected<LocalFileReadBatch, ErrorCode> RealClient::acquire_local_reads(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
+    if (!file_storage_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return file_storage_->AcquireLocalReads(keys, sizes);
+}
+
+tl::expected<LocalFileReadBatch, ErrorCode> ClientRequester::acquire_local_reads(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes) {
+    return invoke_rpc<&RealClient::acquire_local_reads, LocalFileReadBatch>(
+        client_addr, keys, sizes);
+}
+
 bool RealClient::release_offload_buffer(uint64_t batch_id) {
     if (!file_storage_) {
         LOG(WARNING)
