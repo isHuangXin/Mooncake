@@ -7,15 +7,26 @@ if(SKBUILD)
 else()
   include(${CMAKE_CURRENT_LIST_DIR}/../mooncake-common/SetupPython.cmake)
   execute_process(
-    COMMAND ${PYTHON_EXECUTABLE} -c
-            "import sys; print([s for s in sys.path if 'packages' in s][0])"
-    OUTPUT_VARIABLE PYTHON_SYS_PATH)
-  string(STRIP ${PYTHON_SYS_PATH} PYTHON_SYS_PATH)
+    COMMAND "${PYTHON_EXECUTABLE}" -c
+            "import sysconfig; print(sysconfig.get_path('platlib'))"
+    RESULT_VARIABLE PYTHON_PLATLIB_RESULT
+    OUTPUT_VARIABLE PYTHON_PLATLIB
+    ERROR_VARIABLE PYTHON_PLATLIB_ERROR
+    OUTPUT_STRIP_TRAILING_WHITESPACE)
 
-  if("${PYTHON_SYS_PATH}" STREQUAL "")
-    message(FATAL_ERROR "Python path is empty! Please check the python env.")
+  if(NOT PYTHON_PLATLIB_RESULT EQUAL 0)
+    message(
+      FATAL_ERROR
+        "Failed to query Python platlib using ${PYTHON_EXECUTABLE}: ${PYTHON_PLATLIB_ERROR}"
+    )
   endif()
-  set(MOONCAKE_PYTHON_INSTALL_DIR "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}")
+  if(NOT IS_ABSOLUTE "${PYTHON_PLATLIB}")
+    message(
+      FATAL_ERROR
+        "Python platlib must be a non-empty absolute path, got: '${PYTHON_PLATLIB}'"
+    )
+  endif()
+  set(MOONCAKE_PYTHON_INSTALL_DIR "${PYTHON_PLATLIB}/${PYTHON_PACKAGE_NAME}")
 endif()
 
 if(WITH_STORE)
@@ -222,14 +233,12 @@ if(NOT SKBUILD)
     endif()
   endif()
 
-  install(DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/
-          DESTINATION ${MOONCAKE_PYTHON_INSTALL_DIR})
-
   install(
-    CODE "
-          execute_process(COMMAND chmod 767 \"${MOONCAKE_PYTHON_INSTALL_DIR}\")
-          execute_process(COMMAND chmod 766 \"${MOONCAKE_PYTHON_INSTALL_DIR}/__init__.py\")
-      ")
+    DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/${PYTHON_PACKAGE_NAME}/"
+    DESTINATION "${MOONCAKE_PYTHON_INSTALL_DIR}"
+    FILE_PERMISSIONS OWNER_READ OWNER_WRITE GROUP_READ WORLD_READ
+    DIRECTORY_PERMISSIONS OWNER_READ OWNER_WRITE OWNER_EXECUTE GROUP_READ
+                          GROUP_EXECUTE WORLD_READ WORLD_EXECUTE)
 endif()
 
 if(WITH_STORE)
