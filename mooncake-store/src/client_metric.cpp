@@ -7,8 +7,12 @@
 
 #include "bool_parser.h"
 #include "integer_parser.h"
+#include "types.h"
 
 namespace mooncake {
+
+// FLAT_MEMORY: use the Store's UUID generator for each counter/client epoch.
+std::string NewIoMetricsInstanceId() { return UuidToString(generate_uuid()); }
 
 namespace {
 

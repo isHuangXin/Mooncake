@@ -5,12 +5,15 @@
 // calls std::signal without including <csignal> itself.
 #include <csignal>
 #include <cstdlib>
+#include <future>
+#include <limits>
 #include <optional>
 #include <string>
 #include <unordered_set>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "client_metric.h"
+#include "dummy_client.h"
 #include "real_client.h"
 #include "test_server_helpers.h"
 #include "utils.h"
@@ -94,6 +97,496 @@ class ClientMetricsTest : public ::testing::Test {
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
 };
+
+// FLAT_MEMORY: CPU-only substitutes keep real routing and helper logic intact.
+class FetchMetricsClient : public Client {
+   public:
+    FetchMetricsClient() : Client("metrics-test", "P2PHANDSHAKE", "tcp") {}
+    std::function<void()> during_transfer;
+    ErrorCode transfer_error = ErrorCode::OK;
+    std::optional<uint64_t> expected_checksum;
+    size_t transfer_calls = 0;
+
+    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+        const std::vector<std::string>& keys) override {
+        std::vector<tl::expected<QueryResult, ErrorCode>> results;
+        for (size_t i = 0; i < keys.size(); ++i) {
+            Replica::Descriptor replica;
+            replica.status = ReplicaStatus::COMPLETE;
+            replica.descriptor_variant =
+                LocalDiskDescriptor{{0, 1}, 8, "owner"};
+            results.emplace_back(QueryResult(
+                {replica}, std::chrono::steady_clock::now() +
+                               std::chrono::seconds(30), expected_checksum));
+        }
+        return results;
+    }
+
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string&, const std::vector<std::string>&,
+        const std::vector<uintptr_t>&,
+        const std::unordered_map<std::string, std::vector<Slice>>&,
+        OffloadBufferAccess) override {
+        ++transfer_calls;
+        if (during_transfer) during_transfer();
+        if (transfer_error != ErrorCode::OK) {
+            return tl::make_unexpected(transfer_error);
+        }
+        return {};
+    }
+};
+
+class FetchMetricsRequester : public ClientRequester {
+   public:
+    std::function<void()> during_rpc;
+    std::function<void()> during_release;
+    ErrorCode rpc_error = ErrorCode::OK;
+    uint64_t ttl_ms = 30000;
+    bool wrong_pointer_count = false;
+    size_t rpc_calls = 0;
+    size_t releases = 0;
+
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::string&,
+                             const std::vector<std::string>& keys,
+                             const std::vector<int64_t>&) override {
+        ++rpc_calls;
+        if (during_rpc) during_rpc();
+        if (rpc_error != ErrorCode::OK) return tl::make_unexpected(rpc_error);
+        return BatchGetOffloadObjectResponse(
+            1, std::vector<uint64_t>(wrong_pointer_count ? 0 : keys.size(), 1),
+            "owner-te", ttl_ms);
+    }
+    void release_offload_buffer(const std::string&, uint64_t) override {
+        ++releases;
+        if (during_release) during_release();
+    }
+};
+
+class FetchMetricsRealClient : public RealClient {
+   public:
+    const void* device_pointer = nullptr;
+    const void* unknown_pointer = nullptr;
+
+   protected:
+    device::MemoryKind ssd_fetch_memory_kind(const void* ptr) const override {
+        if (ptr == unknown_pointer) return device::MemoryKind::kUnknown;
+        return ptr == device_pointer ? device::MemoryKind::kDevice
+                                     : device::MemoryKind::kHost;
+    }
+};
+
+TEST_F(ClientMetricsTest, IoSnapshotIsCoherentCumulativeAndPerInstance) {
+    SsdToHostFetchStats stats;
+    const auto epoch = stats.Snapshot(true).instance_id;
+    EXPECT_FALSE(epoch.empty());
+    EXPECT_NE(epoch, SsdToHostFetchStats().Snapshot(true).instance_id);
+    const auto start = SsdToHostFetchStats::Clock::now();
+    {
+        SsdToHostFetchStats::Attempt attempt(stats, true);
+        attempt.Start(start);
+        EXPECT_EQ(stats.Snapshot(true).ssd_to_host_fetch->inflight, 1);
+        attempt.Complete(128, start + std::chrono::nanoseconds(200));
+    }
+    {
+        SsdToHostFetchStats::Attempt failure(stats, true);
+    }
+    for (int i = 0; i < 2; ++i) {
+        auto snapshot = stats.Snapshot(true);
+        EXPECT_EQ(snapshot.schema_version, 1);
+        EXPECT_EQ(snapshot.instance_id, epoch);
+        EXPECT_EQ(snapshot.capabilities,
+                  std::vector<std::string>{"ssd_to_host_fetch_v1"});
+        ASSERT_TRUE(snapshot.ssd_to_host_fetch);
+        EXPECT_EQ(snapshot.ssd_to_host_fetch->bytes, 128);
+        EXPECT_EQ(snapshot.ssd_to_host_fetch->latency_ns_sum, 200);
+        EXPECT_EQ(snapshot.ssd_to_host_fetch->batches, 1);
+        EXPECT_EQ(snapshot.ssd_to_host_fetch->errors, 1);
+        EXPECT_EQ(snapshot.ssd_to_host_fetch->inflight, 0);
+    }
+    EXPECT_TRUE(stats.Snapshot(false).capabilities.empty());
+    EXPECT_FALSE(stats.Snapshot(false).ssd_to_host_fetch);
+
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (int i = 0; i < 1000; ++i) {
+            SsdToHostFetchStats::Attempt attempt(stats, true);
+            attempt.Start(start);
+            attempt.Complete(128, start + std::chrono::nanoseconds(200));
+        }
+        done = true;
+    });
+    do {
+        const auto totals = *stats.Snapshot(true).ssd_to_host_fetch;
+        EXPECT_EQ(totals.bytes, totals.batches * 128);
+        EXPECT_EQ(totals.latency_ns_sum, totals.batches * 200);
+        EXPECT_LE(totals.inflight, 1);
+    } while (!done);
+    writer.join();
+}
+
+TEST_F(ClientMetricsTest, IoSnapshotDummyBackendIsUnavailable) {
+    std::shared_ptr<PyClient> dummy = std::make_shared<DummyClient>();
+    const auto snapshot = dummy->get_io_stats_snapshot();
+    EXPECT_EQ(snapshot.schema_version, 1);
+    EXPECT_TRUE(snapshot.instance_id.empty());
+    EXPECT_TRUE(snapshot.capabilities.empty());
+    EXPECT_FALSE(snapshot.ssd_to_host_fetch);
+}
+
+TEST_F(ClientMetricsTest, IoSnapshotRealClientEpochAndLegacyAreNonResetting) {
+    RealClient first;
+    RealClient second;
+    const auto a = first.get_io_stats_snapshot();
+    EXPECT_FALSE(a.instance_id.empty());
+    EXPECT_NE(a.instance_id, second.get_io_stats_snapshot().instance_id);
+    EXPECT_EQ(a.instance_id, first.get_io_stats_snapshot().instance_id);
+    first.io_stats_->ssd_read_ns = 123;
+    first.io_stats_->ssd_read_ops = 4;
+    EXPECT_EQ(first.get_and_reset_io_stats().ssd_read_ns, 123);
+    EXPECT_EQ(first.get_and_reset_io_stats().ssd_read_ops, 4);
+    EXPECT_EQ(first.get_and_reset_io_stats().ssd_read_ns, 123);
+}
+
+TEST_F(ClientMetricsTest, IoFetchOrdinaryAndMultiBufferShareAccounting) {
+    FetchMetricsRealClient real;
+    auto client = std::make_shared<FetchMetricsClient>();
+    auto requester = std::make_shared<FetchMetricsRequester>();
+    real.client_ = client;
+    real.client_requester_ = requester;
+    auto initial = real.get_io_stats_snapshot();
+    ASSERT_TRUE(initial.ssd_to_host_fetch);
+    char a[8] = {}, b[8] = {};
+    requester->during_rpc = [&] {
+        EXPECT_EQ(real.get_io_stats_snapshot().ssd_to_host_fetch->inflight, 1);
+    };
+    requester->during_release = [&] {
+        // Completion is published before release-buffer RPC, not delayed by it.
+        EXPECT_EQ(real.get_io_stats_snapshot().ssd_to_host_fetch->inflight, 0);
+    };
+    auto ordinary = real.batch_get_into_internal({"a", "b"}, {a, b}, {8, 8});
+    ASSERT_EQ(ordinary.size(), 2);
+    ASSERT_TRUE(ordinary[0]);
+    ASSERT_TRUE(ordinary[1]);
+    auto first = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(first.bytes, 16);
+    EXPECT_EQ(first.batches, 1);  // two keys, one owner sub-batch
+    auto multi = real.batch_get_into_multi_buffers_internal(
+        {"a", "b"}, {{a, a + 4}, {b, b + 4}}, {{4, 4}, {4, 4}}, false);
+    ASSERT_TRUE(multi[0]);
+    ASSERT_TRUE(multi[1]);
+    auto second = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(second.bytes, 32);
+    EXPECT_EQ(second.batches, 2);
+    EXPECT_GE(second.latency_ns_sum, first.latency_ns_sum);
+    EXPECT_EQ(second.errors, 0);
+    EXPECT_EQ(requester->rpc_calls, 2);
+    EXPECT_EQ(client->transfer_calls, 2);
+    EXPECT_EQ(requester->releases, 2);
+}
+
+TEST_F(ClientMetricsTest, IoFetchChecksumFailureDoesNotUndoTransferSuccess) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "Run with MOONCAKE_STORE_CHECKSUM=1";
+    }
+    FetchMetricsRealClient real;
+    auto client = std::make_shared<FetchMetricsClient>();
+    client->expected_checksum = 1;
+    real.client_ = client;
+    real.client_requester_ = std::make_shared<FetchMetricsRequester>();
+    char buffer[8] = {};
+    auto ordinary = real.batch_get_into_internal({"a"}, {buffer}, {8});
+    ASSERT_FALSE(ordinary[0]);
+    EXPECT_EQ(ordinary[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+    auto multi = real.batch_get_into_multi_buffers_internal(
+        {"a"}, {{buffer, buffer + 4}}, {{4, 4}}, false);
+    ASSERT_FALSE(multi[0]);
+    EXPECT_EQ(multi[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+    const auto totals = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(totals.batches, 2);
+    EXPECT_EQ(totals.bytes, 16);
+    EXPECT_EQ(totals.errors, 0);
+    EXPECT_EQ(real.get_and_reset_io_stats().ssd_read_ops, 0);
+}
+
+TEST_F(ClientMetricsTest, IoFetchWaitsForTransferAndExcludesFailures) {
+    FetchMetricsRealClient real;
+    auto client = std::make_shared<FetchMetricsClient>();
+    auto requester = std::make_shared<FetchMetricsRequester>();
+    real.client_ = client;
+    real.client_requester_ = requester;
+    char buffer[8] = {};
+    std::unordered_map<std::string, std::vector<Slice>> objects{
+        {"a", {{buffer, sizeof(buffer)}}}};
+    std::promise<void> entered, finish;
+    auto finished = finish.get_future();
+    client->during_transfer = [&] {
+        entered.set_value();
+        finished.wait();
+    };
+    auto result = std::async(std::launch::async, [&] {
+        return real.batch_get_into_offload_object_internal("owner", objects);
+    });
+    entered.get_future().wait();
+    auto pending = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(pending.batches, 0);
+    EXPECT_EQ(pending.bytes, 0);
+    EXPECT_EQ(pending.latency_ns_sum, 0);
+    EXPECT_EQ(pending.inflight, 1);
+    finish.set_value();
+    ASSERT_TRUE(result.get());
+    client->during_transfer = {};
+    auto success = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(success.batches, 1);
+    EXPECT_GT(success.latency_ns_sum, 0);
+
+    requester->rpc_error = ErrorCode::RPC_FAIL;
+    EXPECT_FALSE(real.batch_get_into_offload_object_internal("owner", objects));
+    requester->rpc_error = ErrorCode::OK;
+    client->transfer_error = ErrorCode::TRANSFER_FAIL;
+    EXPECT_FALSE(real.batch_get_into_offload_object_internal("owner", objects));
+    client->transfer_error = ErrorCode::OK;
+    requester->ttl_ms = 0;
+    auto expired =
+        real.batch_get_into_offload_object_internal("owner", objects);
+    ASSERT_FALSE(expired);
+    EXPECT_EQ(expired.error(), ErrorCode::OBJECT_HAS_LEASE);
+    requester->ttl_ms = 30000;
+    requester->wrong_pointer_count = true;
+    EXPECT_FALSE(real.batch_get_into_offload_object_internal("owner", objects));
+    requester->wrong_pointer_count = false;
+    RealClient::OffloadReadRange invalid_range{9, 8};
+    EXPECT_FALSE(real.batch_get_into_offload_object_internal(
+        "owner", objects, &invalid_range));
+    auto after = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(after.bytes, success.bytes);
+    EXPECT_EQ(after.batches, success.batches);
+    EXPECT_EQ(after.latency_ns_sum, success.latency_ns_sum);
+    EXPECT_EQ(after.errors, 5);
+    EXPECT_EQ(after.inflight, 0);
+}
+
+TEST_F(ClientMetricsTest, IoFetchExcludesEmptyDeviceMixedAndUnknown) {
+    FetchMetricsRealClient real;
+    real.client_ = std::make_shared<FetchMetricsClient>();
+    real.client_requester_ = std::make_shared<FetchMetricsRequester>();
+    char host[8] = {}, gpu[8] = {}, unknown[8] = {};
+    real.device_pointer = gpu;
+    real.unknown_pointer = unknown;
+    std::unordered_map<std::string, std::vector<Slice>> objects;
+    EXPECT_TRUE(real.batch_get_into_offload_object_internal("owner", objects));
+    objects = {{"a", {{host, 0}}}};
+    EXPECT_TRUE(real.batch_get_into_offload_object_internal("owner", objects));
+    EXPECT_TRUE(real.batch_get_into_internal({"a"}, {gpu}, {8})[0]);
+    EXPECT_TRUE(real.batch_get_into_multi_buffers_internal(
+        {"a"}, {{host, gpu}}, {{4, 4}}, false)[0]);
+    auto totals = *real.get_io_stats_snapshot().ssd_to_host_fetch;
+    EXPECT_EQ(totals.batches, 0);
+    EXPECT_EQ(totals.bytes, 0);
+    EXPECT_EQ(totals.errors, 0);
+    EXPECT_EQ(totals.inflight, 0);
+    objects = {{"a", {{unknown, 8}}}};
+    EXPECT_TRUE(real.batch_get_into_offload_object_internal("owner", objects));
+    const auto unavailable = real.get_io_stats_snapshot();
+    EXPECT_TRUE(unavailable.capabilities.empty());
+    EXPECT_FALSE(unavailable.ssd_to_host_fetch);
+}
+
+TEST_F(ClientMetricsTest, IoDataSyncedMetricsExposeOnlyAttachedSource) {
+    SsdMetric metric;
+    std::string unavailable;
+    metric.serialize(unavailable);
+    EXPECT_EQ(unavailable.find("mooncake_ssd_io_info"), std::string::npos);
+    EXPECT_EQ(unavailable.find("data_synced_buckets_completed"),
+              std::string::npos);
+    auto stats = std::make_shared<SsdDataSyncedStats>();
+    metric.SetDataSyncedStats(stats);
+    stats->RecordBucketCompleted();
+    stats->RecordBucketCompleted();
+    for (int i = 0; i < 2; ++i) {
+        std::string serialized;
+        metric.serialize(serialized);
+        EXPECT_NE(
+            serialized.find("instance_id=\"" + stats->instance_id() + "\""),
+            std::string::npos);
+        EXPECT_NE(serialized.find(
+                      "semantics=\"data_synced_bucket_completions_v1\"} 1"),
+                  std::string::npos);
+        EXPECT_NE(serialized.find(
+                      "mooncake_ssd_data_synced_buckets_completed_total 2\n"),
+                  std::string::npos);
+        EXPECT_NE(metric.summary_metrics().find(
+                      "data_synced_buckets_completed_total=2"),
+                  std::string::npos);
+    }
+    metric.SetDataSyncedStats(nullptr);
+    std::string detached;
+    metric.serialize(detached);
+    EXPECT_EQ(detached.find("mooncake_ssd_io_info"), std::string::npos);
+}
+
+// FLAT_MEMORY: pure source tests use an injected clock, never files or rings.
+TEST(SsdKvIoMetricsTest, BoundariesOriginAndTimeBasedRetention) {
+    using Stats = SsdKvIoStats;
+    const auto origin = Stats::Clock::time_point(std::chrono::hours(24));
+    uint64_t ns = 0;
+    Stats stats([&] { return origin + std::chrono::nanoseconds(ns); });
+    const auto initial = stats.GetSnapshot();
+    EXPECT_EQ(initial.snapshot_ns, 0);
+    EXPECT_EQ(initial.oldest_bucket_id, 0);
+    stats.RecordCompleted(SsdKvIoDirection::Read, 11);
+    ns = Stats::kBucketWidthNs - 1;
+    stats.RecordCompleted(SsdKvIoDirection::Write, 17);
+    const auto before = stats.GetSnapshot();
+    EXPECT_EQ(before.buckets[0].bytes[0], 11);
+    EXPECT_EQ(before.buckets[0].bytes[1], 17);
+    ns = Stats::kBucketWidthNs;
+    stats.RecordCompleted(SsdKvIoDirection::Read, 23);
+    auto after = stats.GetSnapshot();
+    EXPECT_EQ(after.newest_bucket_id, 1);
+    EXPECT_EQ(after.buckets[1].bytes[0], 23);
+    EXPECT_EQ(after.completed_bytes[0], 34);
+    EXPECT_EQ(before.buckets[1].bytes[0], 0);  // detached, non-resetting copy
+    EXPECT_EQ(after.instance_id, initial.instance_id);
+
+    ns = Stats::kCapacity * Stats::kBucketWidthNs;
+    stats.RecordCompleted(SsdKvIoDirection::Write, 31);
+    after = stats.GetSnapshot();
+    EXPECT_EQ(after.oldest_bucket_id, 1);
+    EXPECT_EQ(after.newest_bucket_id, Stats::kCapacity);
+    EXPECT_EQ(after.buckets[0].id, Stats::kCapacity);
+    EXPECT_EQ(after.buckets[0].bytes[0], 0);
+    EXPECT_EQ(after.buckets[0].bytes[1], 31);
+    EXPECT_EQ(after.completed_bytes[1], 48);  // evicted bytes remain cumulative
+
+    ns = 3 * Stats::kCapacity * Stats::kBucketWidthNs;
+    after = stats.GetSnapshot();
+    EXPECT_EQ(after.oldest_bucket_id, 2 * Stats::kCapacity + 1);
+    std::string text;
+    after.Serialize(text);
+    EXPECT_EQ(text.find("mooncake_ssd_kv_io_bucket_bytes{"), std::string::npos);
+    EXPECT_NE(text.find("mooncake_ssd_kv_io_completed_bytes_total"
+                        "{direction=\"read\"} 34\n"),
+              std::string::npos);
+}
+
+TEST(SsdKvIoMetricsTest, SharedThreadsAndSnapshotsAreCoherent) {
+    auto stats = std::make_shared<SsdKvIoStats>([] {
+        return SsdKvIoStats::Clock::time_point{};
+    });
+    std::atomic<int> running{4};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < 4; ++t) {
+        writers.emplace_back([stats, &running, t] {
+            for (int i = 0; i < 1000; ++i)
+                stats->RecordCompleted(t % 2 ? SsdKvIoDirection::Write
+                                            : SsdKvIoDirection::Read,
+                                       7);
+            --running;
+        });
+    }
+    do {
+        const auto snapshot = stats->GetSnapshot();
+        EXPECT_EQ(snapshot.snapshot_ns, 0);
+        EXPECT_EQ(snapshot.completed_bytes, snapshot.buckets[0].bytes);
+    } while (running.load());
+    for (auto& writer : writers) writer.join();
+    const auto snapshot = stats->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[0], 14000);
+    EXPECT_EQ(snapshot.completed_bytes[1], 14000);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+    EXPECT_EQ(snapshot.observation_losses[1], 0);
+}
+
+TEST(SsdKvIoMetricsTest, FrozenWireIsSparseExactAndIndependentOfDurableOps) {
+    uint64_t ns = 0;
+    auto stats = std::make_shared<SsdKvIoStats>([&] {
+        return SsdKvIoStats::Clock::time_point(std::chrono::nanoseconds(ns));
+    });
+    auto durable = std::make_shared<SsdDataSyncedStats>();
+    SsdMetric metric;
+    metric.SetDataSyncedStats(durable);
+    std::string absent;
+    metric.serialize(absent);
+    EXPECT_EQ(absent.find("mooncake_ssd_kv_io_"), std::string::npos);
+    metric.SetKvIoStats(stats);
+    const uint64_t large = (uint64_t{1} << 53) + 1;
+    stats->RecordCompleted(SsdKvIoDirection::Read, large);
+    stats->RecordObservationLoss(SsdKvIoDirection::Write);
+    ns = 2 * SsdKvIoStats::kBucketWidthNs + 3;
+    stats->RecordCompleted(SsdKvIoDirection::Write, 9);
+    const auto snapshot = stats->GetSnapshot();
+    for (int i = 0; i < 2; ++i) {
+        std::string text;
+        metric.serialize(text);
+        EXPECT_NE(
+            text.find(
+                "mooncake_ssd_kv_io_window_info{schema_version=\"1\","
+                "instance_id=\"" + snapshot.instance_id +
+                "\",semantics=\"bucket_data_cqe_observed_100ms_v1\","
+                "clock=\"steady_relative_ns\",backend=\"io_uring\"} 1\n"),
+            std::string::npos);
+        for (const auto* line : {
+                 "mooncake_ssd_kv_io_bucket_width_ns 100000000\n",
+                 "mooncake_ssd_kv_io_capacity_buckets 16384\n",
+                 "mooncake_ssd_kv_io_snapshot_ns 200000003\n",
+                 "mooncake_ssd_kv_io_oldest_bucket_id 0\n",
+                 "mooncake_ssd_kv_io_newest_bucket_id 2\n",
+                 "mooncake_ssd_kv_io_completed_bytes_total"
+                 "{direction=\"read\"} 9007199254740993\n",
+                 "mooncake_ssd_kv_io_completed_bytes_total"
+                 "{direction=\"write\"} 9\n",
+                 "mooncake_ssd_kv_io_observation_losses_total"
+                 "{direction=\"read\"} 0\n",
+                 "mooncake_ssd_kv_io_observation_losses_total"
+                 "{direction=\"write\"} 1\n",
+                 "mooncake_ssd_kv_io_bucket_bytes"
+                 "{bucket_id=\"0\",direction=\"read\"} 9007199254740993\n",
+                 "mooncake_ssd_kv_io_bucket_bytes"
+                 "{bucket_id=\"0\",direction=\"write\"} 0\n",
+                 "mooncake_ssd_kv_io_bucket_bytes"
+                 "{bucket_id=\"2\",direction=\"read\"} 0\n",
+                 "mooncake_ssd_kv_io_bucket_bytes"
+                 "{bucket_id=\"2\",direction=\"write\"} 9\n",
+                 "mooncake_ssd_data_synced_buckets_completed_total 0\n"}) {
+            EXPECT_NE(text.find(line), std::string::npos) << line;
+        }
+        EXPECT_EQ(text.find("bucket_id=\"1\""), std::string::npos);
+    }
+    EXPECT_EQ(metric.ssd_write_ops.value(), 0);
+    auto replacement = std::make_shared<SsdKvIoStats>();
+    EXPECT_NE(snapshot.instance_id, replacement->GetSnapshot().instance_id);
+    metric.SetKvIoStats(replacement);
+    stats.reset();
+    std::string replaced;
+    metric.serialize(replaced);
+    EXPECT_EQ(replaced.find(snapshot.instance_id), std::string::npos);
+    metric.SetKvIoStats(nullptr);
+    std::string detached;
+    metric.serialize(detached);
+    EXPECT_EQ(detached.find("mooncake_ssd_kv_io_"), std::string::npos);
+    EXPECT_NE(detached.find("mooncake_ssd_io_info"), std::string::npos);
+}
+
+TEST(SsdKvIoMetricsTest, SerializationUsesOneSnapshotClockRead) {
+    uint64_t ticks = 0;
+    auto stats = std::make_shared<SsdKvIoStats>([&] {
+        return SsdKvIoStats::Clock::time_point(
+            std::chrono::nanoseconds(ticks++ * SsdKvIoStats::kBucketWidthNs));
+    });
+    stats->RecordCompleted(SsdKvIoDirection::Read, 8);  // t=100ms, bucket 1
+    SsdMetric metric;
+    metric.SetKvIoStats(stats);
+    std::string text;
+    metric.serialize(text);  // t=200ms, one coherent source copy
+    EXPECT_EQ(ticks, 3);
+    EXPECT_NE(text.find("mooncake_ssd_kv_io_snapshot_ns 200000000\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("mooncake_ssd_kv_io_newest_bucket_id 2\n"),
+              std::string::npos);
+    EXPECT_NE(text.find("bucket_id=\"1\",direction=\"read\"} 8\n"),
+              std::string::npos);
+}
 
 TEST_F(ClientMetricsTest, TransferMetricsSummaryTest) {
     TransferMetric metrics;

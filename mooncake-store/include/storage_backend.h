@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "file_interface.h"
+#include "io_metrics.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
 #include "thread_pool.h"  // P5: for parallel BatchLoad reads
@@ -874,8 +875,21 @@ class BucketStorageBackend : public StorageBackendInterface {
     struct PendingEviction;
 
    public:
-    BucketStorageBackend(const FileStorageConfig& file_storage_config_,
-                         const BucketBackendConfig& bucket_backend_config_);
+    // FLAT_MEMORY: inject the same completion source used by metrics.
+    BucketStorageBackend(
+        const FileStorageConfig& file_storage_config_,
+        const BucketBackendConfig& bucket_backend_config_,
+        std::shared_ptr<SsdDataSyncedStats> data_synced_stats =
+            std::make_shared<SsdDataSyncedStats>(),
+        std::shared_ptr<SsdKvIoStats> kv_io_stats = nullptr);
+
+    std::shared_ptr<const SsdDataSyncedStats> GetDataSyncedStats() const {
+        return data_synced_stats_;
+    }
+
+    std::shared_ptr<const SsdKvIoStats> GetKvIoStats() const {
+        return kv_io_stats_;
+    }
 
     ~BucketStorageBackend();
 
@@ -1076,6 +1090,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    // FLAT_MEMORY: completion counters outlive FileStorage when scraped.
+    const std::shared_ptr<SsdDataSyncedStats> data_synced_stats_;
+    const std::shared_ptr<SsdKvIoStats> kv_io_stats_;
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1103,9 +1121,16 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
 
-    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+   protected:
+    // FLAT_MEMORY: pure role selection, also testable without opening a file.
+    std::shared_ptr<SsdKvIoStats> KvIoObserverForFile(
+        const std::string& path) const;
+
+    // FLAT_MEMORY: deterministic data/sync/metadata failures in CPU tests.
+    virtual tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
 
+   private:
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys);
@@ -1776,6 +1801,7 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 };
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config);
+CreateStorageBackend(const FileStorageConfig& config,
+                     bool owner_metrics_enabled = false);
 
 }  // namespace mooncake

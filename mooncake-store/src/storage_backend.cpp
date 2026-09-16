@@ -1729,8 +1729,17 @@ int64_t BucketIdGenerator::CurrentId() {
 
 BucketStorageBackend::BucketStorageBackend(
     const FileStorageConfig& file_storage_config_,
-    const BucketBackendConfig& bucket_backend_config_)
+    const BucketBackendConfig& bucket_backend_config_,
+    std::shared_ptr<SsdDataSyncedStats> data_synced_stats,
+    std::shared_ptr<SsdKvIoStats> kv_io_stats)
     : StorageBackendInterface(file_storage_config_),
+      data_synced_stats_(std::move(data_synced_stats)),
+#ifdef USE_URING
+      kv_io_stats_(file_storage_config_.use_uring ? std::move(kv_io_stats)
+                                                 : nullptr),
+#else
+      kv_io_stats_(nullptr),
+#endif
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
     // MOONCAKE_SSD_OPT: WriteBucket uses a thread_local 32MB buffer;
@@ -2117,6 +2126,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                                 descs.push_back({uring_ptr->fd(),
                                                  plan.dest_slice.ptr, a_size,
                                                  static_cast<off_t>(a_offset)});
+                                // FLAT_MEMORY: share this DATA file's source.
+                                descs.back().io_observer =
+                                    uring_ptr->io_observer();
+                                descs.back().direction = SsdKvIoDirection::Read;
                                 keys.push_back(plan.key);
                                 data_sizes.push_back(plan.dest_slice.size);
                                 offsets_in_buffer.push_back(actual_offset -
@@ -2256,6 +2269,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 
                 all_descs.push_back({uring_ptr->fd(), plan.dest_slice.ptr, a_size,
                                      static_cast<off_t>(a_offset)});
+                // FLAT_MEMORY: descriptors retain ownership through completion.
+                all_descs.back().io_observer = uring_ptr->io_observer();
+                all_descs.back().direction = SsdKvIoDirection::Read;
                 all_infos.push_back({plan.key, plan.dest_slice.size,
                                      actual_offset - a_offset});
             }
@@ -3048,6 +3064,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    // FLAT_MEMORY: data write + data sync + metadata write succeeded.
+    if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
     return {};
 }
 
@@ -3139,7 +3157,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FlushPreparedBuckets(
         descs.reserve(prepared.size());
         size_t expected_total = 0;
         for (auto& p : prepared) {
-            descs.push_back({p.fd, p.buffer.get(), p.aligned_size, /*off=*/0});
+            descs.push_back({p.fd, p.buffer.get(), p.aligned_size, /*off=*/0,
+                             KvIoObserverForFile(p.bucket_data_path),
+                             SsdKvIoDirection::Write});
             expected_total += p.aligned_size;
         }
 
@@ -3181,6 +3201,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FlushPreparedBuckets(
         if (!meta_result) {
             return fail(meta_result.error());
         }
+        // FLAT_MEMORY: retain this event even if a later bucket/notify fails.
+        if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
     }
     {
         MutexLocker cache_locker(&file_cache_mutex_);
@@ -4175,6 +4197,15 @@ BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
            BUCKET_METADATA_FILE_SUFFIX;
 }
 
+// FLAT_MEMORY: metadata READs can also use O_DIRECT; only the DATA suffix
+// grants observer ownership. Registration/temp files remain unobserved.
+std::shared_ptr<SsdKvIoStats> BucketStorageBackend::KvIoObserverForFile(
+    const std::string& path) const {
+    return std::filesystem::path(path).extension() == BUCKET_DATA_FILE_SUFFIX
+               ? kv_io_stats_
+               : nullptr;
+}
+
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
 BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     int flags = O_CLOEXEC;
@@ -4208,7 +4239,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 #ifdef USE_URING
     if (use_uring) {
-        return std::make_unique<UringFile>(path, fd, 32, true);
+        return std::make_unique<UringFile>(path, fd, 32, true,
+                                           KvIoObserverForFile(path));
     }
 #endif
     return std::make_unique<PosixFile>(path, fd);
@@ -6273,7 +6305,8 @@ void OffsetAllocatorStorageBackend::RemoveAll() {
 //-----------------------------------------------------------------------------
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config) {
+CreateStorageBackend(const FileStorageConfig& config,
+                     bool owner_metrics_enabled) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
@@ -6281,8 +6314,16 @@ CreateStorageBackend(const FileStorageConfig& config) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
             }
+            // FLAT_MEMORY: no allocation/capability for disabled owner metrics
+            // or a POSIX build. The durable-bucket source is unchanged.
+            std::shared_ptr<SsdKvIoStats> kv_io_stats;
+#ifdef USE_URING
+            if (owner_metrics_enabled && config.use_uring)
+                kv_io_stats = std::make_shared<SsdKvIoStats>();
+#endif
             return std::make_shared<BucketStorageBackend>(
-                config, bucket_backend_config);
+                config, bucket_backend_config,
+                std::make_shared<SsdDataSyncedStats>(), std::move(kv_io_stats));
         }
         case StorageBackendType::kFilePerKey: {
             auto file_per_key_backend_config =

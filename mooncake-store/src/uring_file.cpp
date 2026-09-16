@@ -54,6 +54,9 @@ class SharedUringRing {
     // allows more outstanding I/O commands, improving throughput.
     static constexpr unsigned QUEUE_DEPTH = 500;
     static constexpr size_t MIN_CHUNK = 4096;
+    static_assert(
+        QUEUE_DEPTH <= detail::SsdKvIoCompletionTracker::kCapacity / 2,
+        "CQE attribution capacity must cover queued and in-flight SQEs");
 
     static SharedUringRing& instance() {
         thread_local SharedUringRing tl_ring;
@@ -135,35 +138,39 @@ class SharedUringRing {
     // I/O primitives  (no mutex — caller is the sole owner of this ring)
     // -----------------------------------------------------------------
 
-    tl::expected<size_t, ErrorCode> read(int fd, void* buf, size_t len,
-                                         off_t off) {
+    tl::expected<size_t, ErrorCode> read(
+        int fd, void* buf, size_t len, off_t off,
+        const std::shared_ptr<SsdKvIoStats>& observer) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
-        return submit_rw(/*write=*/false, fd, buf, len, off, fix);
+        return submit_rw(/*write=*/false, fd, buf, len, off, fix, observer);
     }
 
-    tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
-                                          off_t off) {
+    tl::expected<size_t, ErrorCode> write(
+        int fd, const void* buf, size_t len, off_t off,
+        const std::shared_ptr<SsdKvIoStats>& observer) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
-                         /*use_fixed_buf=*/false);
+                         /*use_fixed_buf=*/false, observer);
     }
 
-    tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
-                                                int cnt, off_t off) {
+    tl::expected<size_t, ErrorCode> vector_read(
+        int fd, const iovec* iovs, int cnt, off_t off,
+        const std::shared_ptr<SsdKvIoStats>& observer) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        return submit_vector(/*write=*/false, fd, iovs, cnt, off);
+        return submit_vector(/*write=*/false, fd, iovs, cnt, off, observer);
     }
 
-    tl::expected<size_t, ErrorCode> vector_write(int fd, const iovec* iovs,
-                                                 int cnt, off_t off) {
+    tl::expected<size_t, ErrorCode> vector_write(
+        int fd, const iovec* iovs, int cnt, off_t off,
+        const std::shared_ptr<SsdKvIoStats>& observer) {
         if (!initialized_)
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        return submit_vector(/*write=*/true, fd, iovs, cnt, off);
+        return submit_vector(/*write=*/true, fd, iovs, cnt, off, observer);
     }
 
     // Descriptor for one independently-addressed read in a batch.
@@ -206,6 +213,8 @@ class SharedUringRing {
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
+                io_completions_.Prepare(sqe->user_data, d.io_observer,
+                                        d.direction);
             }
 
             auto res = collect_batch(batch, op, descs + idx);
@@ -253,6 +262,8 @@ class SharedUringRing {
                 else
                     io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
+                io_completions_.Prepare(sqe->user_data, d.io_observer,
+                                        d.direction);
             }
 
             auto res = collect_batch(batch, op, descs + idx);
@@ -293,6 +304,7 @@ class SharedUringRing {
             else
                 io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
             sqe->user_data = pending_op_ | static_cast<uint64_t>(i + 1);
+            io_completions_.Prepare(sqe->user_data, d.io_observer, d.direction);
             submitted++;
         }
 
@@ -303,8 +315,10 @@ class SharedUringRing {
                 [this] { return io_uring_sq_ready(&ring_); },
                 [this](unsigned) { return io_uring_submit(&ring_); },
                 [] { std::this_thread::yield(); });
+            io_completions_.Submitted(res.submitted);
             if (res.error != 0 || res.pending != 0 ||
                 res.submitted != static_cast<unsigned>(submitted)) {
+                io_completions_.SubmissionUncertain();
                 drain_submitted(res.submitted, pending_op_);
                 reset_ring();
                 pending_reads_.clear();
@@ -352,7 +366,7 @@ class SharedUringRing {
             // FLAT_MEMORY: retain v0.3.13's large-I/O splitting and CQE tags.
             if (descs[idx].len > max_rw_count()) {
                 const auto& d = descs[idx];
-                auto res = write(d.fd, d.buf, d.len, d.off);
+                auto res = write(d.fd, d.buf, d.len, d.off, d.io_observer);
                 if (!res || res.value() != d.len)
                     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
                 total += res.value();
@@ -377,8 +391,14 @@ class SharedUringRing {
                     return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
                 }
                 const auto& d = descs[idx + i];
+                // FLAT_MEMORY: read-shaped result storage still represents a
+                // write. Preserve both source and direction explicitly.
+                completions[i].io_observer = d.io_observer;
+                completions[i].direction = d.direction;
                 io_uring_prep_write(sqe, d.fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
+                io_completions_.Prepare(sqe->user_data, d.io_observer,
+                                        d.direction);
             }
 
             auto res = collect_batch(batch, op, completions.data());
@@ -409,6 +429,8 @@ class SharedUringRing {
         uint64_t op = next_operation_tag();
         io_uring_prep_fsync(sqe, fd, IORING_FSYNC_DATASYNC);
         sqe->user_data = op;
+        // FLAT_MEMORY: fsync has no DATA bytes, even for an observed file.
+        io_completions_.Prepare(op, nullptr, SsdKvIoDirection::Write);
 
         auto res = collect(1, op);
         if (!res) return tl::make_unexpected(res.error());
@@ -449,6 +471,8 @@ class SharedUringRing {
     void shutdown_ring() {
         if (!initialized_) return;
         if (buf_registered_) io_uring_unregister_buffers(&ring_);
+        // FLAT_MEMORY: report unobserved submitted work before losing its tags.
+        io_completions_.Reset();
         io_uring_queue_exit(&ring_);
         initialized_ = false;
         buf_registered_ = false;
@@ -464,12 +488,14 @@ class SharedUringRing {
     }
 
     detail::UringSubmitResult submit_pending() {
-        return detail::submit_all_pending(
+        auto result = detail::submit_all_pending(
             [this] { return io_uring_sq_ready(&ring_); },
             [this](unsigned pending) {
                 return io_uring_submit_and_wait(&ring_, pending);
             },
             [] { std::this_thread::yield(); });
+        io_completions_.Submitted(result.submitted);
+        return result;
     }
 
     bool wait_cqe(struct io_uring_cqe** cqe) {
@@ -488,11 +514,19 @@ class SharedUringRing {
         }
     }
 
+    // FLAT_MEMORY: this is the sole byte-accounting call per consumed CQE,
+    // including stale tags and partial-submit cleanup. Result aggregation below
+    // retains its existing return/error behavior.
+    void observe_completion(const io_uring_cqe* cqe) {
+        io_completions_.Observe(cqe->user_data, cqe->res);
+    }
+
     bool drain_submitted(unsigned submitted, uint64_t op_id) {
         unsigned processed = 0;
         while (processed < submitted) {
             struct io_uring_cqe* cqe;
             if (!wait_cqe(&cqe)) return false;
+            observe_completion(cqe);
             if ((cqe->user_data & ~BATCH_INDEX_MASK) == op_id) ++processed;
             io_uring_cq_advance(&ring_, 1);
         }
@@ -511,6 +545,7 @@ class SharedUringRing {
                    << " submitted=" << submit.submitted
                    << " pending=" << submit.pending
                    << " error=" << submit.error;
+        io_completions_.SubmissionUncertain();
         drain_submitted(submit.submitted, op_id);
         reset_ring();
         return false;
@@ -593,6 +628,7 @@ class SharedUringRing {
                 reset_ring();
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
+            observe_completion(cqe);
             if (cqe->user_data != op_id) {
                 // Stale CQE from a previous failed operation.
                 io_uring_cq_advance(&ring_, 1);
@@ -629,6 +665,7 @@ class SharedUringRing {
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
+            observe_completion(cqe);
             const uint64_t cqe_op = cqe->user_data & ~BATCH_INDEX_MASK;
             if (cqe_op != op_id) {
                 io_uring_cq_advance(&ring_, 1);
@@ -662,9 +699,9 @@ class SharedUringRing {
     }
 
     // Chunked contiguous read or write.
-    tl::expected<size_t, ErrorCode> submit_rw(bool is_write, int fd, void* buf,
-                                              size_t len, off_t off,
-                                              bool use_fixed_buf) {
+    tl::expected<size_t, ErrorCode> submit_rw(
+        bool is_write, int fd, void* buf, size_t len, off_t off,
+        bool use_fixed_buf, const std::shared_ptr<SsdKvIoStats>& observer) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const bool fix_buf = (use_fixed_buf && buf_registered_);
@@ -703,6 +740,9 @@ class SharedUringRing {
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
                 sqe->user_data = op;
+                io_completions_.Prepare(
+                    op, observer, is_write ? SsdKvIoDirection::Write
+                                           : SsdKvIoDirection::Read);
 
                 ptr += chunk;
                 cur += static_cast<off_t>(chunk);
@@ -723,9 +763,9 @@ class SharedUringRing {
     }
 
     // Scatter/gather read or write (one SQE per iovec, sequential offsets).
-    tl::expected<size_t, ErrorCode> submit_vector(bool is_write, int fd,
-                                                  const iovec* iovs, int cnt,
-                                                  off_t off) {
+    tl::expected<size_t, ErrorCode> submit_vector(
+        bool is_write, int fd, const iovec* iovs, int cnt, off_t off,
+        const std::shared_ptr<SsdKvIoStats>& observer) {
         const ErrorCode err_code =
             is_write ? ErrorCode::FILE_WRITE_FAIL : ErrorCode::FILE_READ_FAIL;
         const size_t max_io = max_rw_count();
@@ -740,7 +780,7 @@ class SharedUringRing {
             if (iovs[idx].iov_len > max_io) {
                 auto res = submit_rw(is_write, fd, iovs[idx].iov_base,
                                      iovs[idx].iov_len, cur,
-                                     /*use_fixed_buf=*/false);
+                                     /*use_fixed_buf=*/false, observer);
                 if (!res) return res;
                 total += res.value();
                 cur += static_cast<off_t>(iovs[idx].iov_len);
@@ -769,6 +809,9 @@ class SharedUringRing {
                     io_uring_prep_read(sqe, fd, iovs[idx].iov_base,
                                        iovs[idx].iov_len, cur);
                 sqe->user_data = op;
+                io_completions_.Prepare(
+                    op, observer, is_write ? SsdKvIoDirection::Write
+                                           : SsdKvIoDirection::Read);
 
                 cur += static_cast<off_t>(iovs[idx].iov_len);
                 ++idx;
@@ -785,6 +828,8 @@ class SharedUringRing {
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
+    // FLAT_MEMORY: bounded preallocated attribution, separate from I/O results.
+    detail::SsdKvIoCompletionTracker io_completions_;
     struct io_uring ring_{};
     bool initialized_ = false;
 
@@ -806,8 +851,11 @@ class SharedUringRing {
 // ============================================================================
 
 UringFile::UringFile(const std::string& filename, int fd,
-                     unsigned /*queue_depth*/, bool use_direct_io)
-    : StorageFile(filename, fd), use_direct_io_(use_direct_io) {
+                     unsigned /*queue_depth*/, bool use_direct_io,
+                     std::shared_ptr<SsdKvIoStats> io_observer)
+    : StorageFile(filename, fd),
+      io_observer_(std::move(io_observer)),
+      use_direct_io_(use_direct_io) {
     if (fd < 0) {
         error_code_ = ErrorCode::FILE_INVALID_HANDLE;
         return;
@@ -904,7 +952,8 @@ tl::expected<size_t, ErrorCode> UringFile::write(std::span<const char> data,
         src = static_cast<char*>(bounce);
     }
 
-    auto res = SharedUringRing::instance().write(fd_, src, write_len, 0);
+    auto res = SharedUringRing::instance().write(fd_, src, write_len, 0,
+                                                io_observer_);
 
     if (bounce) free_aligned_buffer(bounce);
 
@@ -937,7 +986,8 @@ tl::expected<size_t, ErrorCode> UringFile::read(std::string& buffer,
         read_ptr = buffer.data();
     }
 
-    auto res = SharedUringRing::instance().read(fd_, read_ptr, read_len, 0);
+    auto res = SharedUringRing::instance().read(fd_, read_ptr, read_len, 0,
+                                               io_observer_);
 
     if (use_direct_io_) {
         if (res) {
@@ -972,7 +1022,8 @@ tl::expected<size_t, ErrorCode> UringFile::write_aligned(const void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().write(fd_, buffer, length, offset);
+    return SharedUringRing::instance().write(fd_, buffer, length, offset,
+                                             io_observer_);
 }
 
 tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
@@ -989,7 +1040,8 @@ tl::expected<size_t, ErrorCode> UringFile::read_aligned(void* buffer,
             return make_error<size_t>(ErrorCode::FILE_INVALID_BUFFER);
     }
 
-    return SharedUringRing::instance().read(fd_, buffer, length, offset);
+    return SharedUringRing::instance().read(fd_, buffer, length, offset,
+                                            io_observer_);
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,6 +1063,11 @@ tl::expected<void, ErrorCode> UringFile::batch_read(ReadDesc* descs, int cnt) {
         }
     }
 
+    // FLAT_MEMORY: single-fd batches inherit the file's explicit DATA role.
+    for (int i = 0; i < cnt; ++i) {
+        descs[i].io_observer = io_observer_;
+        descs[i].direction = SsdKvIoDirection::Read;
+    }
     return SharedUringRing::instance().batch_read(fd_, descs, cnt);
 }
 
@@ -1024,7 +1081,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_write(const iovec* iov,
     if (fd_ < 0) return make_error<size_t>(ErrorCode::FILE_NOT_FOUND);
     auto start = std::chrono::steady_clock::now();
     auto res =
-        SharedUringRing::instance().vector_write(fd_, iov, iovcnt, offset);
+        SharedUringRing::instance().vector_write(fd_, iov, iovcnt, offset,
+                                                  io_observer_);
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)
                   .count();
@@ -1044,7 +1102,8 @@ tl::expected<size_t, ErrorCode> UringFile::vector_read(const iovec* iov,
     auto start = std::chrono::steady_clock::now();
 
     auto res =
-        SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset);
+        SharedUringRing::instance().vector_read(fd_, iov, iovcnt, offset,
+                                                 io_observer_);
 
     auto us = std::chrono::duration_cast<std::chrono::microseconds>(
                   std::chrono::steady_clock::now() - start)

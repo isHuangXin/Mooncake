@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "types.h"
 #include "mutex.h"
+#include "io_metrics.h"  // FLAT_MEMORY: optional DATA-file completion observer
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
@@ -197,7 +198,13 @@ class PosixFile : public StorageFile {
 class UringFile : public StorageFile {
    public:
     UringFile(const std::string &filename, int fd, unsigned queue_depth = 32,
-              bool use_direct_io = false);
+              bool use_direct_io = false,
+              std::shared_ptr<SsdKvIoStats> io_observer = nullptr);
+
+    // FLAT_MEMORY: copy shared ownership into cross-fd / async descriptors.
+    const std::shared_ptr<SsdKvIoStats>& io_observer() const {
+        return io_observer_;
+    }
     ~UringFile() override;
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
@@ -228,6 +235,9 @@ class UringFile : public StorageFile {
         size_t bytes_read = 0;
         ErrorCode error = ErrorCode::OK;
         bool completed = false;
+        // FLAT_MEMORY: reads and read-shaped write completions stay distinct.
+        std::shared_ptr<SsdKvIoStats> io_observer;
+        SsdKvIoDirection direction = SsdKvIoDirection::Read;
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
 
@@ -245,6 +255,9 @@ class UringFile : public StorageFile {
         size_t bytes_read = 0;
         ErrorCode error = ErrorCode::OK;
         bool completed = false;
+        // FLAT_MEMORY: reads and read-shaped write completions stay distinct.
+        std::shared_ptr<SsdKvIoStats> io_observer;
+        SsdKvIoDirection direction = SsdKvIoDirection::Read;
     };
     static tl::expected<size_t, ErrorCode> batch_read_multi_fd(
         ReadDescMultiFd *descs, int cnt);
@@ -265,6 +278,9 @@ class UringFile : public StorageFile {
         const void *buf;   ///< aligned source buffer
         size_t len;        ///< aligned write length
         off_t off;         ///< file offset (typically 0)
+        // FLAT_MEMORY: optional owner source; ordinary files remain unobserved.
+        std::shared_ptr<SsdKvIoStats> io_observer;
+        SsdKvIoDirection direction = SsdKvIoDirection::Write;
     };
     static tl::expected<size_t, ErrorCode> batch_write_multi_fd(
         const WriteDesc *descs, int cnt);
@@ -285,6 +301,8 @@ class UringFile : public StorageFile {
     bool is_buffer_registered() const;
 
    private:
+    // FLAT_MEMORY: backend + files + async descriptors share the same source.
+    const std::shared_ptr<SsdKvIoStats> io_observer_;
     bool use_direct_io_;
     static constexpr size_t ALIGNMENT_ = 4096;
 

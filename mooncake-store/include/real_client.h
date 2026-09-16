@@ -18,6 +18,8 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "device/accelerator_device.h"
+#include "io_metrics.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -1101,7 +1103,19 @@ class RealClient : public PyClient {
     // FLAT_MEMORY: return cumulative counters without resetting them.
     IoStatsSnapshot get_and_reset_io_stats();
 
+    // FLAT_MEMORY: cumulative successful all-Host SSD owner fetch sub-batches.
+    // Includes owner RPC + transfer + TTL, excludes Master query and checksum.
+    ClientIoStatsSnapshot get_io_stats_snapshot() const override;
+
+   protected:
+    // Passive classification must not initialize an accelerator runtime.
+    // Virtual to exercise device/unknown destinations in CPU-only tests.
+    virtual device::MemoryKind ssd_fetch_memory_kind(const void* ptr) const;
+
    private:
+    SsdToHostFetchStats ssd_to_host_fetch_stats_;
+    // Resolve passive classifier availability at construction, never at scrape.
+    const bool ssd_fetch_host_classification_available_;
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

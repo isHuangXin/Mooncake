@@ -125,6 +125,13 @@ class FileStorageTest : public ::testing::Test {
         return bucket_backend->UngroupedOffloadingObjectsSize();
     }
 
+    // FLAT_MEMORY: drive backend completion without service threads.
+    static std::shared_ptr<BucketStorageBackend> BucketBackend(
+        FileStorage& fs) {
+        return std::dynamic_pointer_cast<BucketStorageBackend>(
+            fs.storage_backend_);
+    }
+
     // Static funnel to the private FileStorage::IsPerBucketSoftOffloadError.
     // FileStorageTest is friended; TEST_F-generated subclasses are not.
     static bool CallIsPerBucketSoftOffloadError(ErrorCode error) {
@@ -754,6 +761,70 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
             << "key not found in batch_data: " << key;
         EXPECT_EQ(data, found->second);
     }
+}
+
+// FLAT_MEMORY: both dispatch modes publish the backend's completion source.
+TEST_F(FileStorageTest, IoDataSyncedMetricUsesBackendForSerialAndParallel) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.use_uring = false;
+    SsdMetric metric;
+    FileStorage storage(config, nullptr, "unused", &metric);
+    auto backend = BucketBackend(storage);
+    ASSERT_TRUE(backend);
+    ASSERT_TRUE(backend->Init());
+    std::string value(128, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> objects{
+        {"a", {{value.data(), value.size()}}},
+        {"b", {{value.data(), value.size()}}}};
+    ASSERT_TRUE(backend->BatchOffload(objects, [](const auto&, auto&) {
+        return ErrorCode::OK;
+    }));
+    std::vector<BucketStorageBackend::PreparedBucket> prepared;
+    auto p = backend->PrepareBatchOffload(
+        {{"c", {{value.data(), value.size()}}}});
+    ASSERT_TRUE(p);
+    prepared.push_back(std::move(*p));
+    ASSERT_TRUE(backend->FlushPreparedBuckets(prepared));
+    ASSERT_TRUE(backend->CommitBucket(prepared[0], [](const auto&, auto&) {
+        return ErrorCode::OK;
+    }));
+    EXPECT_EQ(backend->GetDataSyncedStats()->buckets_completed(), 2);
+    // FLAT_MEMORY: POSIX durable metrics do not fake CQE byte capability.
+    EXPECT_FALSE(backend->GetKvIoStats());
+    for (int i = 0; i < 2; ++i) {
+        std::string serialized;
+        metric.serialize(serialized);
+        EXPECT_NE(serialized.find(
+                      "mooncake_ssd_data_synced_buckets_completed_total 2\n"),
+                  std::string::npos);
+        EXPECT_NE(serialized.find(backend->GetDataSyncedStats()->instance_id()),
+                  std::string::npos);
+        EXPECT_EQ(serialized.find("mooncake_ssd_kv_io_"), std::string::npos);
+        EXPECT_NE(metric.summary_metrics().find(
+                      "data_synced_buckets_completed_total=2"),
+                  std::string::npos);
+    }
+    // The old per-key ops are unrelated and must not be renamed/reused.
+    EXPECT_EQ(metric.ssd_write_ops.value(), 0);
+}
+
+TEST_F(FileStorageTest, IoDataSyncedMetricUnavailableForOtherBackends) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    SsdMetric metric;
+    FileStorage storage(config, nullptr, "unused", &metric);
+    EXPECT_FALSE(BucketBackend(storage));
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_EQ(serialized.find("mooncake_ssd_io_info"), std::string::npos);
+    EXPECT_EQ(serialized.find("data_synced_buckets_completed"),
+              std::string::npos);
+    // FLAT_MEMORY: unsupported backends publish neither capability nor zero.
+    EXPECT_EQ(serialized.find("mooncake_ssd_kv_io_"), std::string::npos);
 }
 
 TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {

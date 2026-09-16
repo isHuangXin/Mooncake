@@ -75,6 +75,43 @@ class TestReplicateConfig(unittest.TestCase):
             config.soft_pin_ttl_ms = 1 << 64
 
 
+# FLAT_MEMORY: run these against an isolated new binding, never a live service.
+class TestIoStatsSnapshotBinding(unittest.TestCase):
+    def test_uninitialized_backend_is_unavailable_not_zero(self):
+        snapshot = MooncakeDistributedStore().get_io_stats_snapshot()
+        self.assertEqual(snapshot["schema_version"], 1)
+        self.assertEqual(snapshot["instance_id"], "")
+        self.assertEqual(snapshot["capabilities"], [])
+        self.assertIsNone(snapshot["ssd_to_host_fetch"])
+
+    def test_real_client_fields_nonreset_and_new_instance_epoch(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+        # Missing required config returns before creating a Client, GPU runtime,
+        # transport, RPC connection or any service. It still creates RealClient.
+        self.assertNotEqual(store.setup({}), 0)
+        first = store.get_io_stats_snapshot()
+        self.assertEqual(first["schema_version"], 1)
+        self.assertIsInstance(first["instance_id"], str)
+        self.assertTrue(first["instance_id"])
+        if "ssd_to_host_fetch_v1" not in first["capabilities"]:
+            self.assertIsNone(first["ssd_to_host_fetch"])
+        else:
+            counters = first["ssd_to_host_fetch"]
+            self.assertEqual(set(counters), {
+                "bytes", "latency_ns_sum", "batches", "errors", "inflight"
+            })
+            for value in counters.values():
+                self.assertIs(type(value), int)
+                self.assertEqual(value, 0)
+        self.assertEqual(first, store.get_io_stats_snapshot())
+        store.get_and_reset_io_stats()
+        self.assertEqual(first, store.get_io_stats_snapshot())
+        self.assertNotEqual(store.setup({}), 0)
+        second = store.get_io_stats_snapshot()
+        self.assertNotEqual(first["instance_id"], second["instance_id"])
+
+
 class TestConfigDictSetup(unittest.TestCase):
     """Test configuration-dictionary setup through the Python store wrapper."""
 

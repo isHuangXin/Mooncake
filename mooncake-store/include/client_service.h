@@ -158,7 +158,8 @@ class Client {
      * @return Vector of QueryResult objects containing replicas and lease
      * timeouts
      */
-    std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
+    // FLAT_MEMORY: virtual for CPU-only owner-fetch metrics tests.
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys);
     std::vector<tl::expected<QueryResult, ErrorCode>> BatchQuery(
         const std::vector<std::string>& object_keys,
@@ -561,7 +562,8 @@ class Client {
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
 
-    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+    // FLAT_MEMORY: mock the blocking transfer boundary without a live engine.
+    virtual tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
         const std::vector<std::string>& keys,
         const std::vector<uintptr_t>& pointers,

@@ -16,6 +16,7 @@
 #include <ylt/metric/summary.hpp>
 #include "environ.h"
 #include "hybrid_metric.h"
+#include "io_metrics.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -553,7 +554,39 @@ struct SsdMetric {
     ylt::metric::summary_t ssd_total_latency_summary;
     std::chrono::steady_clock::time_point start_time_;
 
+    // FLAT_MEMORY: attach the backend's source, not mirrored Prom counters.
+    // Null means unsupported; emit neither a marker nor a fake zero.
+    void SetDataSyncedStats(std::shared_ptr<const SsdDataSyncedStats> stats) {
+        std::atomic_store(&data_synced_stats_, std::move(stats));
+    }
+
+    // FLAT_MEMORY: optional reset-free DATA-file byte window source.
+    void SetKvIoStats(std::shared_ptr<const SsdKvIoStats> stats) {
+        std::atomic_store(&kv_io_stats_, std::move(stats));
+    }
+
     void serialize(std::string& str) {
+        if (auto stats = std::atomic_load(&kv_io_stats_)) {
+            // One coherent copy, all string formatting outside the source lock.
+            stats->GetSnapshot().Serialize(str);
+        }
+        if (auto stats = std::atomic_load(&data_synced_stats_)) {
+            str +=
+                "# HELP mooncake_ssd_io_info SSD I/O counter capability "
+                "and epoch\n"
+                "# TYPE mooncake_ssd_io_info gauge\n"
+                "mooncake_ssd_io_info{schema_version=\"1\",instance_id=\"";
+            str += stats->instance_id();
+            str +=
+                "\",semantics=\"data_synced_bucket_completions_v1\"} 1\n"
+                "# HELP mooncake_ssd_data_synced_buckets_completed_total "
+                "Buckets whose data write, data sync and metadata write "
+                "completed\n"
+                "# TYPE mooncake_ssd_data_synced_buckets_completed_total "
+                "counter\n"
+                "mooncake_ssd_data_synced_buckets_completed_total ";
+            str += std::to_string(stats->buckets_completed()) + "\n";
+        }
         ssd_read_bytes.serialize(str);
         ssd_write_bytes.serialize(str);
         ssd_read_ops.serialize(str);
@@ -571,6 +604,16 @@ struct SsdMetric {
     std::string summary_metrics() {
         std::stringstream ss;
         ss << "=== SSD Metrics Summary ===" << "\n";
+        // FLAT_MEMORY: same source as /metrics, no reset or sampling I/O.
+        if (auto stats = std::atomic_load(&data_synced_stats_)) {
+            ss << "SSD data-synced I/O: schema_version=1, instance_id="
+               << stats->instance_id()
+               << ", semantics=data_synced_bucket_completions_v1, "
+                  "data_synced_buckets_completed_total="
+               << stats->buckets_completed()
+               << " (data synced; metadata write succeeded, "
+                  "not crash-durable)\n";
+        }
 
         auto read_bytes = ssd_read_bytes.value();
         auto write_bytes = ssd_write_bytes.value();
@@ -631,6 +674,10 @@ struct SsdMetric {
     }
 
    private:
+    // FLAT_MEMORY: atomic shared_ptr access also makes replacement scrape-safe.
+    std::shared_ptr<const SsdDataSyncedStats> data_synced_stats_;
+    std::shared_ptr<const SsdKvIoStats> kv_io_stats_;
+
     std::string format_summary_percentiles(ylt::metric::summary_t& summary) {
         double sum = 0;
         uint64_t count = 0;

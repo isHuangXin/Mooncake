@@ -13,6 +13,7 @@
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
+#include "integer_parser.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
@@ -84,13 +85,24 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         }
     }
 
-    auto create_storage_backend_result = CreateStorageBackend(config_);
+    // FLAT_MEMORY: allocate the byte window only for an enabled owner exporter.
+    auto create_storage_backend_result =
+        CreateStorageBackend(config_, ssd_metric_ != nullptr);
     if (!create_storage_backend_result) {
         LOG(ERROR) << "Failed to create storage backend";
         throw std::runtime_error("Failed to create storage backend");
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    // FLAT_MEMORY: publish capability only for a wired bucket backend.
+    // Exporters read this source, never a second counter updated per key/batch.
+    if (ssd_metric_) {
+        auto bucket =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+        ssd_metric_->SetDataSyncedStats(
+            bucket ? bucket->GetDataSyncedStats() : nullptr);
+        ssd_metric_->SetKvIoStats(bucket ? bucket->GetKvIoStats() : nullptr);
+    }
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
@@ -220,8 +232,10 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     // MOONCAKE_SSD_OPT: Create dedicated thread pool for parallel bucket
     // offload.  Threads are reused across eviction rounds, avoiding per-wave
     // std::async thread creation/destruction overhead.
+    // FLAT_MEMORY: use the existing parser (GetEnvOr had no definition).
+    const char* parallelism_env = std::getenv("MOONCAKE_OFFLOAD_PARALLELISM");
     const int offload_parallelism =
-        GetEnvOr<int>("MOONCAKE_OFFLOAD_PARALLELISM", 8);
+        parallelism_env ? TryParseInteger<int>(parallelism_env).value_or(8) : 8;
     if (offload_parallelism > 1) {
         offload_thread_pool_ =
             std::make_unique<ThreadPool>(offload_parallelism);
