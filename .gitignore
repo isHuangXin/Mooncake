@@ -1,6 +1,7 @@
 .cache
 .vscode
 build
+/build-ssd-kv-100ms-b200-20260916-GvYwPs/
 build_ofed4
 old
 local_test
