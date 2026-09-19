@@ -13,6 +13,7 @@
 
 #include "client_service.h"
 #include "client_buffer.h"
+#include "io_metrics.h"
 #include "mutex.h"
 #include "utils.h"
 #include "file_storage.h"
@@ -142,6 +143,8 @@ struct ShmFdResponse {
 class ClientRequester {
    public:
     ClientRequester();
+    // Deterministic owner RPC/release substitutes in CPU-only tests.
+    virtual ~ClientRequester() = default;
 
     /**
      * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
@@ -149,7 +152,7 @@ class ClientRequester {
      * Transfer Engine service.
      * @param keys Map from object key to size (bytes);
      */
-    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    virtual tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
     batch_get_offload_object(const std::string &client_addr,
                              const std::vector<std::string> &keys,
                              const std::vector<int64_t> &sizes);
@@ -161,8 +164,8 @@ class ClientRequester {
      * @param client_addr Network address of the remote FileStorage service.
      * @param batch_id The batch_id returned from batch_get_offload_object.
      */
-    void release_offload_buffer(const std::string &client_addr,
-                                uint64_t batch_id);
+    virtual void release_offload_buffer(const std::string &client_addr,
+                                        uint64_t batch_id);
 
    private:
     /**
@@ -434,6 +437,9 @@ class PyClient {
         }
         return client_buffer_allocator_->allocate(size);
     }
+
+    // Unsupported/Dummy backends must not manufacture measured zeros.
+    virtual ClientIoStatsSnapshot get_io_stats_snapshot() const { return {}; }
 
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;

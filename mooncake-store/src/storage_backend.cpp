@@ -1706,8 +1706,21 @@ int64_t BucketIdGenerator::CurrentId() {
 
 BucketStorageBackend::BucketStorageBackend(
     const FileStorageConfig& file_storage_config_,
-    const BucketBackendConfig& bucket_backend_config_)
+    const BucketBackendConfig& bucket_backend_config_,
+    std::shared_ptr<SsdDataSyncedStats> data_synced_stats)
     : StorageBackendInterface(file_storage_config_),
+      data_synced_stats_(std::move(data_synced_stats)),
+#ifdef USE_URING
+      // This baseline uses io_uring for DATA reads, POSIX for DATA writes.
+      // Do not advertise write-CQE zero as a measured value.
+      kv_io_stats_(file_storage_config_.use_uring
+                       ? std::make_shared<SsdKvIoStats>(
+                             [] { return SsdKvIoStats::Clock::now(); },
+                             std::array<bool, 2>{true, false})
+                       : nullptr),
+#else
+      kv_io_stats_(nullptr),
+#endif
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
     // Allocate aligned buffer for O_DIRECT I/O operations
@@ -2737,6 +2750,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    // Count only DATA write + datasync + metadata write success. No new sync
+    // and no claim of metadata crash durability; rollback never subtracts.
+    if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
     return {};
 }
 
@@ -3582,6 +3598,11 @@ BucketStorageBackend::GetBucketMetadataPath(int64_t bucket_id) {
            BUCKET_METADATA_FILE_SUFFIX;
 }
 
+std::shared_ptr<SsdKvIoStats> BucketStorageBackend::KvIoObserverForFile(
+    const std::string& path) const {
+    return path.ends_with(BUCKET_DATA_FILE_SUFFIX) ? kv_io_stats_ : nullptr;
+}
+
 tl::expected<std::unique_ptr<StorageFile>, ErrorCode>
 BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     int flags = O_CLOEXEC;
@@ -3612,7 +3633,8 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 #ifdef USE_URING
     if (file_storage_config_.use_uring && mode == FileMode::Read) {
-        return std::make_unique<UringFile>(path, fd, 32, true);
+        return std::make_unique<UringFile>(path, fd, 32, true,
+                                          KvIoObserverForFile(path));
     }
 #endif
     return std::make_unique<PosixFile>(path, fd);

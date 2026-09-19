@@ -86,6 +86,14 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    // Only a wired bucket backend can advertise these measured capabilities.
+    if (ssd_metric_) {
+        auto bucket =
+            std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+        ssd_metric_->SetDataSyncedStats(
+            bucket ? bucket->GetDataSyncedStats() : nullptr);
+        ssd_metric_->SetKvIoStats(bucket ? bucket->GetKvIoStats() : nullptr);
+    }
     if (auto distributed_backend =
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {

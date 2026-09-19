@@ -871,8 +871,19 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
 class BucketStorageBackend : public StorageBackendInterface {
    public:
-    BucketStorageBackend(const FileStorageConfig& file_storage_config_,
-                         const BucketBackendConfig& bucket_backend_config_);
+    BucketStorageBackend(
+        const FileStorageConfig& file_storage_config_,
+        const BucketBackendConfig& bucket_backend_config_,
+        std::shared_ptr<SsdDataSyncedStats> data_synced_stats =
+            std::make_shared<SsdDataSyncedStats>());
+
+    std::shared_ptr<const SsdDataSyncedStats> GetDataSyncedStats() const {
+        return data_synced_stats_;
+    }
+
+    std::shared_ptr<const SsdKvIoStats> GetKvIoStats() const {
+        return kv_io_stats_;
+    }
 
     ~BucketStorageBackend();
 
@@ -1027,6 +1038,9 @@ class BucketStorageBackend : public StorageBackendInterface {
         EvictionHandler eviction_handler = nullptr) override;
 
    private:
+    const std::shared_ptr<SsdDataSyncedStats> data_synced_stats_;
+    const std::shared_ptr<SsdKvIoStats> kv_io_stats_;
+
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
         const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
@@ -1050,9 +1064,14 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<std::string, ErrorCode> GetBucketDataPath(int64_t bucket_id);
 
-    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+   protected:
+    // Pure role selection and deterministic file failure seams for CPU tests.
+    std::shared_ptr<SsdKvIoStats> KvIoObserverForFile(
+        const std::string& path) const;
+    virtual tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
         const std::string& path, FileMode mode) const;
 
+   private:
     tl::expected<void, ErrorCode> GroupOffloadingKeysByBucket(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
         std::vector<std::vector<std::string>>& buckets_keys);

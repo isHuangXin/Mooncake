@@ -3244,7 +3244,39 @@ PYBIND11_MODULE(store, m) {
             "    task_id: UUID of the task to query.\n\n"
             "Returns:\n"
             "    tuple[QueryTaskResponse | None, int]: (QueryTaskResponse if "
-            "success, error code: 0 if success, non-zero if failure)");
+            "success, error code: 0 if success, non-zero if failure)")
+        .def(
+            "get_io_stats_snapshot",
+            [](MooncakeStorePyWrapper &self) -> py::dict {
+                ClientIoStatsSnapshot stats;
+                {
+                    py::gil_scoped_release release;
+                    if (self.store_) {
+                        stats = self.store_->get_io_stats_snapshot();
+                    }
+                }
+                py::dict result;
+                result["schema_version"] = stats.schema_version;
+                result["instance_id"] = stats.instance_id;
+                result["capabilities"] = stats.capabilities;
+                result["ssd_to_host_fetch"] = py::none();
+                if (stats.ssd_to_host_fetch) {
+                    const auto &fetch = *stats.ssd_to_host_fetch;
+                    py::dict counters;
+                    counters["bytes"] = fetch.bytes;
+                    counters["latency_ns_sum"] = fetch.latency_ns_sum;
+                    counters["batches"] = fetch.batches;
+                    counters["errors"] = fetch.errors;
+                    counters["inflight"] = fetch.inflight;
+                    result["ssd_to_host_fetch"] = std::move(counters);
+                }
+                return result;
+            },
+            "Get a coherent cumulative SSD-to-Host fetch snapshot without "
+            "resetting counters. Successful owner sub-batches include owner "
+            "RPC, transfer and TTL acceptance, not master queries, buffer "
+            "release or outer checksums. Dummy or unclassifiable backends "
+            "return no capability and null counters.");
 
     // Expose NUMA binding as a module-level function (no self required)
     m.def(

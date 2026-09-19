@@ -116,6 +116,12 @@ class FileStorageTest : public ::testing::Test {
                                                          buckets_keys);
     }
 
+    static std::shared_ptr<BucketStorageBackend> BucketBackend(
+        FileStorage& storage) {
+        return std::dynamic_pointer_cast<BucketStorageBackend>(
+            storage.storage_backend_);
+    }
+
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
         auto bucket_backend = std::dynamic_pointer_cast<BucketStorageBackend>(
             fileStorage.storage_backend_);
@@ -754,6 +760,58 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
             << "key not found in batch_data: " << key;
         EXPECT_EQ(data, found->second);
     }
+}
+
+TEST_F(FileStorageTest, IoDataSyncedMetricUsesSerialBackendSource) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.use_uring = false;
+    SsdMetric metric;
+    FileStorage storage(config, nullptr, "unused", &metric);
+    auto backend = BucketBackend(storage);
+    ASSERT_TRUE(backend);
+    ASSERT_TRUE(backend->Init());
+    std::string value(128, 'x');
+    std::unordered_map<std::string, std::vector<Slice>> objects{
+        {"a", {{value.data(), value.size()}}},
+        {"b", {{value.data(), value.size()}}}};
+    auto notify = [](const auto&, auto&) { return ErrorCode::OK; };
+    ASSERT_TRUE(backend->BatchOffload(objects, notify));
+    ASSERT_TRUE(backend->BatchOffload(
+        {{"c", {{value.data(), value.size()}}}}, notify));
+    EXPECT_EQ(backend->GetDataSyncedStats()->buckets_completed(), 2);
+    EXPECT_FALSE(backend->GetKvIoStats());  // POSIX is not a CQE source
+    for (int i = 0; i < 2; ++i) {
+        std::string text;
+        metric.serialize(text);
+        EXPECT_NE(text.find(
+                      "mooncake_ssd_data_synced_buckets_completed_total 2\n"),
+                  std::string::npos);
+        EXPECT_NE(text.find(backend->GetDataSyncedStats()->instance_id()),
+                  std::string::npos);
+        EXPECT_EQ(text.find("mooncake_ssd_kv_io_"), std::string::npos);
+        EXPECT_NE(metric.summary_metrics().find(
+                      "data_synced_buckets_completed_total=2"),
+                  std::string::npos);
+    }
+    EXPECT_EQ(metric.ssd_write_ops.value(), 0);  // legacy per-key counter
+}
+
+TEST_F(FileStorageTest, IoDataSyncedMetricUnavailableForOtherBackends) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.local_buffer_size = 1024 * 1024;
+    config.use_uring = false;
+    config.storage_backend_type = StorageBackendType::kFilePerKey;
+    SsdMetric metric;
+    FileStorage storage(config, nullptr, "unused", &metric);
+    EXPECT_FALSE(BucketBackend(storage));
+    std::string text;
+    metric.serialize(text);
+    EXPECT_EQ(text.find("mooncake_ssd_io_info"), std::string::npos);
+    EXPECT_EQ(text.find("data_synced_buckets_completed"), std::string::npos);
+    EXPECT_EQ(text.find("mooncake_ssd_kv_io_"), std::string::npos);
 }
 
 TEST_F(FileStorageTest, BatchLoadRecordsSsdMetrics) {

@@ -18,6 +18,7 @@
 #include "client_service.h"
 #include "client_buffer.h"
 #include "device/cuda_ipc_buffer_handle.h"
+#include "device/accelerator_device.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -1064,7 +1065,17 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> setup_ascend_internal(
         size_t local_buffer_size);
 
+    // Successful all-Host SSD owner fetch sub-batches, cumulative and readonly.
+    ClientIoStatsSnapshot get_io_stats_snapshot() const override;
+
+   protected:
+    // Passive classification must not initialize an accelerator runtime.
+    virtual device::MemoryKind ssd_fetch_memory_kind(const void* ptr) const;
+
    private:
+    SsdToHostFetchStats ssd_to_host_fetch_stats_;
+    // Resolve classifier availability once, never while taking a snapshot.
+    const bool ssd_fetch_host_classification_available_;
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;

@@ -9,8 +9,11 @@
 
 #include "bool_parser.h"
 #include "integer_parser.h"
+#include "types.h"
 
 namespace mooncake {
+
+std::string NewIoMetricsInstanceId() { return UuidToString(generate_uuid()); }
 
 namespace {
 

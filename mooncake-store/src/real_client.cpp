@@ -46,6 +46,7 @@
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
 #ifdef USE_CUDA
+#include <cuda.h>
 #include <cuda_runtime.h>
 #endif
 #ifdef USE_INTRA_NVLINK
@@ -64,6 +65,42 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+// Unlike RuntimeAccelerators(), this never initializes CUDA or a context.
+// A driver/query failure is unknown, never Host. Keep the driver loaded for
+// the lifetime of the function pointer.
+#ifdef USE_CUDA
+using PassiveCudaPointerQuery = CUresult (*)(unsigned int, CUpointer_attribute*,
+                                             void**, CUdeviceptr);
+
+PassiveCudaPointerQuery GetPassiveCudaPointerQuery() {
+    static auto query = [] {
+        void* handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+        return reinterpret_cast<PassiveCudaPointerQuery>(
+            handle ? dlsym(handle, "cuPointerGetAttributes") : nullptr);
+    }();
+    return query;
+}
+#endif
+
+bool SsdFetchHostClassificationAvailable() {
+#if defined(USE_MLU) || defined(USE_SUPA) || defined(USE_TPU) || \
+    defined(USE_FLAGCX) || defined(USE_ASCEND_HETEROGENEOUS)
+    return false;
+#endif
+    for (const auto* accelerator :
+         device::GetAcceleratorRegistry().RegisteredDevices()) {
+        // Other vendors currently expose only runtime-initializing probes.
+        if (accelerator->Vendor() != device::AcceleratorVendor::kNvidia) {
+            return false;
+        }
+    }
+#ifdef USE_CUDA
+    return GetPassiveCudaPointerQuery() != nullptr;
+#else
+    return device::GetAcceleratorRegistry().RegisteredDevices().empty();
+#endif
+}
 
 size_t DivideRoundUp(size_t value, size_t divisor) {
     return value / divisor + (value % divisor != 0);
@@ -715,7 +752,9 @@ void ResourceTracker::startSignalThread() {
     });
 }
 
-RealClient::RealClient() {
+RealClient::RealClient()
+    : ssd_fetch_host_classification_available_(
+          SsdFetchHostClassificationAvailable()) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
     const char *hp = std::getenv("MC_STORE_USE_HUGEPAGE");
@@ -6906,6 +6945,42 @@ bool RealClient::can_use_pinned_restore_arena(
     return has_data;
 }
 
+// Managed/device pointers never enter the Host-only totals.
+device::MemoryKind RealClient::ssd_fetch_memory_kind(const void* ptr) const {
+    if (!ptr || !ssd_fetch_host_classification_available_) {
+        return device::MemoryKind::kUnknown;
+    }
+#ifdef USE_CUDA
+    unsigned int memory_type = 0;
+    unsigned int managed = 0;
+    CUpointer_attribute attributes[] = {CU_POINTER_ATTRIBUTE_MEMORY_TYPE,
+                                       CU_POINTER_ATTRIBUTE_IS_MANAGED};
+    void* values[] = {&memory_type, &managed};
+    auto query = GetPassiveCudaPointerQuery();
+    if (query(2, attributes, values, reinterpret_cast<CUdeviceptr>(ptr)) !=
+        CUDA_SUCCESS) {
+        return device::MemoryKind::kUnknown;
+    }
+    if (managed || memory_type == CU_MEMORYTYPE_DEVICE ||
+        memory_type == CU_MEMORYTYPE_UNIFIED) {
+        return device::MemoryKind::kDevice;
+    }
+    // Multi-attribute driver queries return zero attributes for ordinary,
+    // unregistered Host memory (unlike the single-attribute API).
+    return memory_type == 0 || memory_type == CU_MEMORYTYPE_HOST
+               ? device::MemoryKind::kHost
+               : device::MemoryKind::kUnknown;
+#else
+    return device::MemoryKind::kHost;
+#endif
+}
+
+ClientIoStatsSnapshot RealClient::get_io_stats_snapshot() const {
+    // Short-lock snapshot; no reset, I/O, transfer waits or GPU probes.
+    return ssd_to_host_fetch_stats_.Snapshot(
+        ssd_fetch_host_classification_available_);
+}
+
 tl::expected<void, ErrorCode>
 RealClient::batch_get_into_offload_object_internal(
     const std::string &target_rpc_service_addr,
@@ -6913,6 +6988,26 @@ RealClient::batch_get_into_offload_object_internal(
     const OffloadReadRange *read_range) {
     offload_rpc_read_count_.fetch_add(1, std::memory_order_relaxed);
     auto start_time = std::chrono::steady_clock::now();
+
+    // Account once here for ordinary and multi-buffer callers. A mixed
+    // Host/device owner sub-batch is excluded in its entirety.
+    bool all_host = true;
+    bool has_payload = false;
+    for (const auto& [key, slices] : objects) {
+        for (const auto& slice : slices) {
+            if (!slice.size) continue;
+            has_payload = true;
+            const auto kind = ssd_fetch_memory_kind(slice.ptr);
+            all_host &= kind == device::MemoryKind::kHost;
+            if (kind == device::MemoryKind::kUnknown) {
+                ssd_to_host_fetch_stats_.MarkUnclassifiable();
+            }
+        }
+    }
+    SsdToHostFetchStats::Attempt fetch_attempt(ssd_to_host_fetch_stats_,
+                                              all_host && has_payload);
+    uint64_t fetch_bytes = 0;
+    bool fetch_bytes_representable = true;
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
@@ -6942,12 +7037,23 @@ RealClient::batch_get_into_offload_object_internal(
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
         }
+        if (total > std::numeric_limits<uint64_t>::max() - fetch_bytes) {
+            // Observability must not change the existing request outcome.
+            // Withdraw unrepresentable Host totals rather than wrap or clamp.
+            fetch_bytes_representable = false;
+            if (all_host) ssd_to_host_fetch_stats_.MarkUnclassifiable();
+        } else {
+            fetch_bytes += total;
+        }
         sizes.emplace_back(storage_size);
     }
 
     const bool local_batch =
         can_use_pinned_restore_arena(target_rpc_service_addr, objects);
     std::optional<FileStorage::LocalBatchResult> local_owner;
+    // Exclude classification/setup and master query; include owner RPC and
+    // BatchGetOffloadObject's completed transfer future.
+    fetch_attempt.Start(std::chrono::steady_clock::now());
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {
         if (!local_batch) {
@@ -7013,6 +7119,9 @@ RealClient::batch_get_into_offload_object_internal(
     if (!local_batch && elapsed_time >= response->gc_ttl_ms) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_LEASE);
     }
+    // Publish before release-buffer RPC. Outer checksum failures do not undo
+    // this successful transfer, and are deliberately outside the denominator.
+    if (fetch_bytes_representable) fetch_attempt.Complete(fetch_bytes, end_time);
     return {};
 }
 
