@@ -6,6 +6,7 @@
 #include <cstdio>
 #include "types.h"
 #include "mutex.h"
+#include "io_metrics.h"
 #include <atomic>
 #include <thread>
 #include <sys/file.h>
@@ -193,7 +194,8 @@ class PosixFile : public StorageFile {
 class UringFile : public StorageFile {
    public:
     UringFile(const std::string &filename, int fd, unsigned queue_depth = 32,
-              bool use_direct_io = false);
+              bool use_direct_io = false,
+              std::shared_ptr<SsdKvIoStats> io_observer = nullptr);
     ~UringFile() override;
 
     tl::expected<size_t, ErrorCode> write(const std::string &buffer,
@@ -245,6 +247,8 @@ class UringFile : public StorageFile {
    private:
     bool use_direct_io_;
     bool track_bucket_reads_;
+    // Only bucket DATA files attach an owner; metadata/fsync never contribute.
+    const std::shared_ptr<SsdKvIoStats> io_observer_;
     static constexpr size_t ALIGNMENT_ = 4096;
 
     /// Allocate / free an O_DIRECT aligned bounce buffer.

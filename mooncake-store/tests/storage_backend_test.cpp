@@ -8,6 +8,7 @@
 #include <iostream>
 #include <limits>
 #include <cmath>
+#include <cerrno>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -228,6 +229,339 @@ class StorageBackendTest : public ::testing::Test {
         }
     }
 };
+
+// Pure attribution/file-role tests: no io_uring initialization or services.
+class BucketKvIoTestBackend : public BucketStorageBackend {
+   public:
+    using BucketStorageBackend::BucketStorageBackend;
+    using BucketStorageBackend::KvIoObserverForFile;
+};
+
+TEST(SsdKvIoCompletionTest, BackendCapabilityIsDataReadOnlyOnThisBaseline) {
+    FileStorageConfig config;
+    config.use_uring = true;
+    BucketKvIoTestBackend backend(config, BucketBackendConfig{});
+#ifdef USE_URING
+    ASSERT_TRUE(backend.GetKvIoStats());
+    const auto source = backend.GetKvIoStats();
+    EXPECT_TRUE(source->GetSnapshot().direction_available[0]);
+    // Existing bucket writes stay POSIX; do not claim measured zero CQE writes.
+    EXPECT_FALSE(source->GetSnapshot().direction_available[1]);
+    EXPECT_EQ(backend.KvIoObserverForFile("/unused/7.bucket"), source);
+    EXPECT_FALSE(backend.KvIoObserverForFile("/unused/7.meta"));
+    EXPECT_FALSE(backend.KvIoObserverForFile("/unused/7.bucket.meta"));
+    EXPECT_FALSE(backend.KvIoObserverForFile("/unused/temp_for_registration"));
+#else
+    EXPECT_FALSE(backend.GetKvIoStats());
+    EXPECT_FALSE(backend.KvIoObserverForFile("/unused/7.bucket"));
+#endif
+    config.use_uring = false;
+    BucketKvIoTestBackend posix(config, BucketBackendConfig{});
+    EXPECT_FALSE(posix.GetKvIoStats());
+    EXPECT_FALSE(posix.KvIoObserverForFile("/unused/7.bucket"));
+    EXPECT_TRUE(posix.GetDataSyncedStats());
+}
+
+TEST(SsdKvIoCompletionTest, ActualPositiveBytesSurviveErrorsAndCleanup) {
+    uint64_t ns = 0;
+    auto source = std::make_shared<SsdKvIoStats>([&] {
+        return SsdKvIoStats::Clock::time_point(std::chrono::nanoseconds(ns));
+    });
+    detail::SsdKvIoCompletionTracker tracker;
+    tracker.Prepare(257, source, SsdKvIoDirection::Write);
+    tracker.Prepare(258, source, SsdKvIoDirection::Write);
+    tracker.Prepare(259, nullptr, SsdKvIoDirection::Write);
+    tracker.Submitted(3);
+    ns = SsdKvIoStats::kBucketWidthNs - 1;
+    tracker.Observe(257, 123);  // actual short result, not requested length
+    ns = SsdKvIoStats::kBucketWidthNs;
+    tracker.Observe(258, -EIO);
+    tracker.Observe(259, 4096);  // positive metadata never contributes
+    tracker.Prepare(512, nullptr, SsdKvIoDirection::Write);
+    tracker.Submitted(1);
+    tracker.Observe(512, 0);  // fsync never contributes
+    tracker.Reset();
+    auto snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[1], 123);
+    EXPECT_EQ(snapshot.buckets[0].bytes[1], 123);
+    EXPECT_EQ(snapshot.buckets[1].bytes[1], 0);
+    EXPECT_EQ(snapshot.observation_losses[1], 0);
+
+    tracker.Prepare(769, source, SsdKvIoDirection::Read);
+    tracker.Prepare(770, source, SsdKvIoDirection::Read);
+    tracker.Prepare(771, source, SsdKvIoDirection::Read);
+    tracker.Submitted(2);
+    tracker.Observe(770, 17);  // out-of-order partial-submit cleanup
+    tracker.Observe(769, 31);
+    tracker.Reset();  // known unsubmitted third SQE is not observation loss
+    snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[0], 48);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+    EXPECT_EQ(snapshot.buckets[1].bytes[0], 48);
+}
+
+TEST(SsdKvIoCompletionTest, FailedSubmitRetainsBytesAndFlagsUnknownTail) {
+    auto source = std::make_shared<SsdKvIoStats>();
+    detail::SsdKvIoCompletionTracker tracker;
+    tracker.Prepare(257, source, SsdKvIoDirection::Write);
+    tracker.Prepare(258, source, SsdKvIoDirection::Write);
+    tracker.Prepare(259, source, SsdKvIoDirection::Write);
+    tracker.Submitted(2);
+    tracker.SubmissionUncertain();
+    tracker.Observe(258, 19);
+    tracker.Observe(257, 23);
+    tracker.Reset();
+    const auto snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[1], 42);
+    EXPECT_EQ(snapshot.observation_losses[1], 1);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+}
+
+TEST(SsdKvIoCompletionTest, SplitScalarAndThreadOwnersAggregateAtObservation) {
+    uint64_t ns = 0;
+    auto source = std::make_shared<SsdKvIoStats>([&] {
+        return SsdKvIoStats::Clock::time_point(std::chrono::nanoseconds(ns));
+    });
+    detail::SsdKvIoCompletionTracker scalar, other_thread;
+    scalar.Prepare(256, source, SsdKvIoDirection::Write);
+    scalar.Prepare(256, source, SsdKvIoDirection::Write);
+    scalar.Submitted(2);
+    other_thread.Prepare(257, source, SsdKvIoDirection::Read);
+    other_thread.Submitted(1);
+    EXPECT_EQ(source->GetSnapshot().completed_bytes[0], 0);
+    ns = 2 * SsdKvIoStats::kBucketWidthNs;
+    scalar.Observe(256, 4096);
+    scalar.Observe(256, 9);
+    other_thread.Observe(257, 8192);  // consumed now, not at submission
+    scalar.Reset();
+    other_thread.Reset();
+    const auto snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.buckets[2].bytes[0], 8192);
+    EXPECT_EQ(snapshot.buckets[2].bytes[1], 4105);
+    EXPECT_EQ(snapshot.completed_bytes, snapshot.buckets[2].bytes);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+    EXPECT_EQ(snapshot.observation_losses[1], 0);
+}
+
+TEST(SsdKvIoCompletionTest, UnreapedUnknownAndDuplicateCompletionsSignalLoss) {
+    auto source = std::make_shared<SsdKvIoStats>();
+    detail::SsdKvIoCompletionTracker tracker;
+    tracker.Prepare(257, source, SsdKvIoDirection::Read);
+    tracker.Prepare(258, source, SsdKvIoDirection::Read);
+    tracker.Prepare(259, source, SsdKvIoDirection::Write);
+    tracker.Submitted(3);
+    tracker.Observe(257, 4096);
+    tracker.Observe(259, -EIO);
+    tracker.Reset();  // wait failure left one read unobserved
+    auto snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[0], 4096);
+    EXPECT_EQ(snapshot.observation_losses[0], 1);
+    EXPECT_EQ(snapshot.observation_losses[1], 0);
+    tracker.Prepare(513, source, SsdKvIoDirection::Write);
+    tracker.Submitted(1);
+    tracker.Observe(512, 99);  // invalid index: loss, never invented bytes
+    tracker.Observe(513, 7);
+    tracker.Observe(513, 7);  // duplicate must not double count
+    snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[1], 7);
+    EXPECT_EQ(snapshot.observation_losses[0], 1);
+    EXPECT_GE(snapshot.observation_losses[1], 2);
+    tracker.Reset();
+}
+
+TEST(SsdKvIoCompletionTest, KnownDuplicateLossStaysInOriginalDirection) {
+    auto source = std::make_shared<SsdKvIoStats>();
+    detail::SsdKvIoCompletionTracker tracker;
+    tracker.Prepare(257, source, SsdKvIoDirection::Write);
+    tracker.Prepare(258, nullptr, SsdKvIoDirection::Read);
+    tracker.Prepare(259, source, SsdKvIoDirection::Read);
+    tracker.Submitted(3);
+    tracker.Observe(257, 13);
+    tracker.Observe(258, 512);
+    tracker.Observe(258, 512);  // metadata duplicate cannot taint DATA
+    tracker.Observe(257, 13);  // write duplicate cannot taint read
+    tracker.Observe(259, 17);
+    tracker.Reset();
+    const auto snapshot = source->GetSnapshot();
+    EXPECT_EQ(snapshot.completed_bytes[0], 17);
+    EXPECT_EQ(snapshot.completed_bytes[1], 13);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+    EXPECT_EQ(snapshot.observation_losses[1], 1);
+}
+
+TEST(SsdKvIoCompletionTest, BaselineDepthBatchesReuseBoundedAttributionSlots) {
+    auto source = std::make_shared<SsdKvIoStats>([] {
+        return SsdKvIoStats::Clock::time_point{};
+    });
+    detail::SsdKvIoCompletionTracker tracker;
+    uint64_t expected = 0;
+    for (uint64_t op = 1; op <= 100; ++op) {
+        for (unsigned i = 1; i <= 32; ++i)
+            tracker.Prepare((op << 8) | i, i % 17 ? source : nullptr,
+                            SsdKvIoDirection::Read);
+        tracker.Submitted(13);
+        tracker.Submitted(19);
+        for (unsigned i = 32; i > 0; --i) {
+            tracker.Observe((op << 8) | i, static_cast<int>(i));
+            if (i % 17) expected += i;
+        }
+    }
+    tracker.Reset();
+    const auto snapshot = source->GetSnapshot();
+    EXPECT_TRUE(snapshot.available);
+    EXPECT_EQ(snapshot.completed_bytes[0], expected);
+    EXPECT_EQ(snapshot.buckets[0].bytes[0], expected);
+    EXPECT_EQ(snapshot.observation_losses[0], 0);
+}
+
+TEST(SsdKvIoCompletionTest, StaleTagsKeepOriginalSourceAndSharedLifetime) {
+    auto old_source = std::make_shared<SsdKvIoStats>();
+    auto new_source = std::make_shared<SsdKvIoStats>();
+    detail::SsdKvIoCompletionTracker tracker;
+    tracker.Prepare(257, old_source, SsdKvIoDirection::Read);
+    tracker.Prepare(769, new_source, SsdKvIoDirection::Write);
+    tracker.Submitted(2);
+    std::weak_ptr<SsdKvIoStats> weak = old_source;
+    old_source.reset();
+    tracker.Observe(257, 29);  // stale tag still belongs to old owner
+    tracker.Observe(769, 37);
+    auto retained = weak.lock();
+    ASSERT_TRUE(retained);
+    EXPECT_EQ(retained->GetSnapshot().completed_bytes[0], 29);
+    EXPECT_EQ(new_source->GetSnapshot().completed_bytes[1], 37);
+    EXPECT_EQ(new_source->GetSnapshot().completed_bytes[0], 0);
+    tracker.Reset();
+    retained.reset();
+    EXPECT_TRUE(weak.expired());
+}
+
+TEST(SsdKvIoCompletionTest, AttributionOverflowWithdrawsCapability) {
+    auto source = std::make_shared<SsdKvIoStats>();
+    detail::SsdKvIoCompletionTracker tracker;
+    for (size_t i = 0; i <= detail::SsdKvIoCompletionTracker::kCapacity; ++i)
+        tracker.Prepare(i, source, SsdKvIoDirection::Read);
+    const auto snapshot = source->GetSnapshot();
+    EXPECT_FALSE(snapshot.available);
+    EXPECT_GT(snapshot.observation_losses[0], 0);
+    std::string text;
+    snapshot.Serialize(text);
+    EXPECT_TRUE(text.empty());
+    tracker.Reset();
+
+    // Scalar chunks may share a tag: pending capacity must be bounded too.
+    source = std::make_shared<SsdKvIoStats>();
+    for (size_t i = 0; i <= detail::SsdKvIoCompletionTracker::kCapacity; ++i)
+        tracker.Prepare(1, source, SsdKvIoDirection::Write);
+    EXPECT_FALSE(source->GetSnapshot().available);
+    tracker.Reset();
+}
+
+// Real temporary POSIX files, with deterministic failures at existing serial
+// DATA write, DATA sync and metadata write boundaries. No parallel-offload API.
+enum class BucketIoFailure { kNone, kDataWrite, kShortData, kDataSync, kMetadata };
+
+class BucketIoTestFile : public PosixFile {
+   public:
+    BucketIoTestFile(const std::string& path, int fd, BucketIoFailure failure,
+                     bool metadata)
+        : PosixFile(path, fd), failure_(failure), metadata_(metadata) {}
+    using PosixFile::write;
+    tl::expected<size_t, ErrorCode> write(const std::string& buffer,
+                                         size_t length) override {
+        if (metadata_ && failure_ == BucketIoFailure::kMetadata)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return PosixFile::write(buffer, length);
+    }
+    tl::expected<size_t, ErrorCode> vector_write(const iovec* iov, int count,
+                                                off_t offset) override {
+        if (!metadata_ && failure_ == BucketIoFailure::kDataWrite)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        if (!metadata_ && failure_ == BucketIoFailure::kShortData) return 0;
+        return PosixFile::vector_write(iov, count, offset);
+    }
+    tl::expected<void, ErrorCode> datasync() override {
+        if (!metadata_ && failure_ == BucketIoFailure::kDataSync)
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        return PosixFile::datasync();
+    }
+
+   private:
+    BucketIoFailure failure_;
+    bool metadata_;
+};
+
+class BucketIoTestBackend : public BucketStorageBackend {
+   public:
+    BucketIoTestBackend(const FileStorageConfig& config,
+                        std::shared_ptr<SsdDataSyncedStats> stats)
+        : BucketStorageBackend(config, BucketBackendConfig{}, std::move(stats)) {}
+    BucketIoFailure failure = BucketIoFailure::kNone;
+
+   protected:
+    tl::expected<std::unique_ptr<StorageFile>, ErrorCode> OpenFile(
+        const std::string& path, FileMode mode) const override {
+        if (mode != FileMode::Write)
+            return BucketStorageBackend::OpenFile(path, mode);
+        int fd = open(path.c_str(), O_CLOEXEC | O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd < 0) return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        return std::unique_ptr<StorageFile>(new BucketIoTestFile(
+            path, fd, failure, fs::path(path).extension() == ".meta"));
+    }
+};
+
+TEST_F(StorageBackendTest, IoDataSyncedBucketsCountBucketsNotKeysOrNotifications) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = false;
+    auto stats = std::make_shared<SsdDataSyncedStats>();
+    BucketIoTestBackend backend(config, stats);
+    ASSERT_TRUE(backend.Init());
+    std::string value(128, 'x');
+    auto batch = [&](const std::string& prefix) {
+        std::unordered_map<std::string, std::vector<Slice>> objects;
+        for (int i = 0; i < 3; ++i)
+            objects[prefix + std::to_string(i)] = {{value.data(), value.size()}};
+        return objects;
+    };
+    ASSERT_TRUE(backend.BatchOffload(batch("serial"), [](const auto&, auto&) {
+        return ErrorCode::OK;
+    }));
+    EXPECT_EQ(stats->buckets_completed(), 1);
+    EXPECT_FALSE(backend.BatchOffload(batch("notify-failed"), [](const auto&, auto&) {
+        return ErrorCode::RPC_FAIL;
+    }));
+    EXPECT_EQ(stats->buckets_completed(), 2);  // rollback never subtracts
+    backend.RemoveAll();
+    EXPECT_EQ(stats->buckets_completed(), 2);  // not a current-file gauge
+    EXPECT_NE(stats->instance_id(), SsdDataSyncedStats().instance_id());
+}
+
+TEST_F(StorageBackendTest, IoDataSyncedFailuresPreserveEarlierSerialSuccess) {
+    for (auto failure : {BucketIoFailure::kDataWrite, BucketIoFailure::kShortData,
+                         BucketIoFailure::kDataSync, BucketIoFailure::kMetadata}) {
+        FileStorageConfig config;
+        config.storage_filepath = data_path + "/failure-" +
+                                  std::to_string(static_cast<int>(failure));
+        fs::create_directories(config.storage_filepath);
+        config.use_uring = false;
+        auto stats = std::make_shared<SsdDataSyncedStats>();
+        BucketIoTestBackend backend(config, stats);
+        ASSERT_TRUE(backend.Init());
+        std::string value(128, 'x');
+        auto notify = [](const auto&, auto&) { return ErrorCode::OK; };
+        ASSERT_TRUE(backend.BatchOffload(
+            {{"good", {{value.data(), value.size()}}}}, notify));
+        EXPECT_EQ(stats->buckets_completed(), 1);
+        backend.failure = failure;
+        EXPECT_FALSE(backend.BatchOffload(
+            {{"bad", {{value.data(), value.size()}}}}, notify));
+        EXPECT_EQ(stats->buckets_completed(), 1);
+        backend.failure = BucketIoFailure::kNone;
+        ASSERT_TRUE(backend.BatchOffload(
+            {{"next", {{value.data(), value.size()}}}}, notify));
+        EXPECT_EQ(stats->buckets_completed(), 2);
+    }
+}
 
 // Regression tests for StorageBackend::Create validation (issue #3134):
 // invalid configuration must be reported as INVALID_PARAMS instead of
