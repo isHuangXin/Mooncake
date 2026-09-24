@@ -192,7 +192,19 @@ bool GDSReader::EndIOWindow(uint64_t window_id, int64_t end_ns, bool abort) {
     return lock.owns_lock() && impl_->io_metric.EndWindow(window_id, end_ns, false);
 }
 
-std::string GDSReader::IOWindow() const { return impl_->io_metric.SnapshotJson(); }
+std::string GDSReader::IOWindow() const {
+    auto output = impl_->io_metric.SnapshotJson();
+#ifdef STORE_USE_GDS
+    const bool available = impl_->driver_open && impl_->registered;
+#else
+    const bool available = false;
+#endif
+    // Reader readiness does not prove a successful SSD file registration or read.
+    output.pop_back();
+    output += std::string(",\"ssd_io_available\":") +
+              (available ? "true}" : "false}");
+    return output;
+}
 int64_t GDSReader::IOClockNs() { return StorageIOMetric::MonotonicNs(); }
 
 std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
