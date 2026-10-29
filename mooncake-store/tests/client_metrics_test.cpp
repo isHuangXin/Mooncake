@@ -264,17 +264,19 @@ TEST_F(ClientMetricsTest, IoFetchOrdinaryAndMultiBufferShareAccounting) {
         // Completion is published before release-buffer RPC, not delayed by it.
         EXPECT_EQ(real.get_io_stats_snapshot().ssd_to_host_fetch->inflight, 0);
     };
-    auto ordinary = real.batch_get_into_internal({"a", "b"}, {a, b}, {8, 8});
-    ASSERT_EQ(ordinary.size(), 2);
-    ASSERT_TRUE(ordinary[0]);
-    ASSERT_TRUE(ordinary[1]);
+    // FLAT_MEMORY: source-aware wrappers preserve byte counts and key order.
+    auto [ordinary, ordinary_sources] =
+        real.batch_get_into_with_sources({"a", "b"}, {a, b}, {8, 8});
+    EXPECT_EQ(ordinary, (std::vector<int64_t>{8, 8}));
+    EXPECT_EQ(ordinary_sources, (std::vector<int>{2, 2}));
     auto first = *real.get_io_stats_snapshot().ssd_to_host_fetch;
     EXPECT_EQ(first.bytes, 16);
     EXPECT_EQ(first.batches, 1);  // two keys, one owner sub-batch
-    auto multi = real.batch_get_into_multi_buffers_internal(
-        {"a", "b"}, {{a, a + 4}, {b, b + 4}}, {{4, 4}, {4, 4}}, false);
-    ASSERT_TRUE(multi[0]);
-    ASSERT_TRUE(multi[1]);
+    auto [multi, multi_sources] =
+        real.batch_get_into_multi_buffers_with_sources(
+            {"a", "b"}, {{a, a + 4}, {b, b + 4}}, {{4, 4}, {4, 4}}, false);
+    EXPECT_EQ(multi, (std::vector<int>{8, 8}));
+    EXPECT_EQ(multi_sources, (std::vector<int>{2, 2}));
     auto second = *real.get_io_stats_snapshot().ssd_to_host_fetch;
     EXPECT_EQ(second.bytes, 32);
     EXPECT_EQ(second.batches, 2);
@@ -283,6 +285,69 @@ TEST_F(ClientMetricsTest, IoFetchOrdinaryAndMultiBufferShareAccounting) {
     EXPECT_EQ(requester->rpc_calls, 2);
     EXPECT_EQ(client->transfer_calls, 2);
     EXPECT_EQ(requester->releases, 2);
+}
+
+// FLAT_MEMORY: reuse the owner-fetch substitutes; no services or GPU needed.
+TEST_F(ClientMetricsTest, HostReadSourcesPreserveErrorsAndLegacyDefaults) {
+    RealClient real;
+    const auto invalid = toInt(ErrorCode::INVALID_PARAMS);
+    EXPECT_TRUE(real.batch_get_into_with_sources({}, {}, {}).first.empty());
+    EXPECT_TRUE(real.batch_get_into_with_sources({}, {}, {}).second.empty());
+    auto uninitialized = real.batch_get_into_multi_buffers_with_sources(
+        {"a"}, {{nullptr}}, {{8}}, false);
+    EXPECT_EQ(uninitialized.first, (std::vector<int>{invalid}));
+    EXPECT_EQ(uninitialized.second, (std::vector<int>{0}));
+
+    auto client = std::make_shared<FetchMetricsClient>();
+    auto requester = std::make_shared<FetchMetricsRequester>();
+    real.client_ = client;
+    real.client_requester_ = requester;
+    char a[8] = {}, b[8] = {};
+    auto mismatch = real.batch_get_into_with_sources({"a"}, {}, {8});
+    EXPECT_EQ(mismatch.first, real.batch_get_into({"a"}, {}, {8}));
+    EXPECT_EQ(mismatch.second, (std::vector<int>{0}));
+    auto multi_mismatch = real.batch_get_into_multi_buffers_with_sources(
+        {"a"}, {}, {{8}}, false);
+    EXPECT_EQ(multi_mismatch.first, (std::vector<int>{invalid}));
+    EXPECT_EQ(multi_mismatch.second, (std::vector<int>{0}));
+    EXPECT_EQ(requester->rpc_calls, 0);
+
+    auto mixed = real.batch_get_into_with_sources({"a", "b"}, {a, b}, {8, 4});
+    EXPECT_EQ(mixed.first, (std::vector<int64_t>{8, invalid}));
+    EXPECT_EQ(mixed.second, (std::vector<int>{2, 0}));
+    auto multi = real.batch_get_into_multi_buffers_with_sources(
+        {"a", "b"}, {{a}, {b}}, {{4, 4}, {8}}, false);
+    EXPECT_EQ(multi.first, (std::vector<int>{invalid, 8}));
+    EXPECT_EQ(multi.second, (std::vector<int>{0, 2}));
+    auto duplicates =
+        real.batch_get_into_with_sources({"a", "a"}, {a, b}, {8, 8});
+    EXPECT_EQ(duplicates.first, real.batch_get_into({"a", "a"}, {a, b}, {8, 8}));
+    EXPECT_EQ(duplicates.second, (std::vector<int>{0, 0}));
+    auto multi_duplicates = real.batch_get_into_multi_buffers_with_sources(
+        {"a", "a"}, {{a}, {b}}, {{8}, {8}}, false);
+    EXPECT_EQ(multi_duplicates.second, (std::vector<int>{0, 0}));
+
+    // Exercise non-reporting base implementations without a new mock subclass.
+    auto legacy = real.PyClient::batch_get_into_with_sources({"a"}, {a}, {8});
+    EXPECT_EQ(legacy.first, (std::vector<int64_t>{8}));
+    EXPECT_EQ(legacy.second, (std::vector<int>{0}));
+    auto legacy_multi = real.PyClient::batch_get_into_multi_buffers_with_sources(
+        {"a"}, {{a}}, {{8}}, false);
+    EXPECT_EQ(legacy_multi.first, (std::vector<int>{8}));
+    EXPECT_EQ(legacy_multi.second, (std::vector<int>{0}));
+
+    requester->rpc_error = ErrorCode::RPC_FAIL;
+    auto rpc_failure = real.batch_get_into_with_sources({"a"}, {a}, {8});
+    EXPECT_EQ(rpc_failure.first,
+              (std::vector<int64_t>{toInt(ErrorCode::RPC_FAIL)}));
+    EXPECT_EQ(rpc_failure.second, (std::vector<int>{0}));
+    requester->rpc_error = ErrorCode::OK;
+    client->transfer_error = ErrorCode::TRANSFER_FAIL;
+    auto transfer_failure = real.batch_get_into_multi_buffers_with_sources(
+        {"a"}, {{a}}, {{8}}, false);
+    EXPECT_EQ(transfer_failure.first,
+              (std::vector<int>{toInt(ErrorCode::TRANSFER_FAIL)}));
+    EXPECT_EQ(transfer_failure.second, (std::vector<int>{0}));
 }
 
 TEST_F(ClientMetricsTest, IoFetchChecksumFailureDoesNotUndoTransferSuccess) {
@@ -295,13 +360,19 @@ TEST_F(ClientMetricsTest, IoFetchChecksumFailureDoesNotUndoTransferSuccess) {
     real.client_ = client;
     real.client_requester_ = std::make_shared<FetchMetricsRequester>();
     char buffer[8] = {};
-    auto ordinary = real.batch_get_into_internal({"a"}, {buffer}, {8});
+    // FLAT_MEMORY: transfer metrics can succeed while read provenance is UNKNOWN
+    // because the caller cannot accept data that failed the checksum.
+    std::vector<int> sources{3};
+    auto ordinary = real.batch_get_into_internal({"a"}, {buffer}, {8}, &sources);
     ASSERT_FALSE(ordinary[0]);
     EXPECT_EQ(ordinary[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+    EXPECT_EQ(sources, (std::vector<int>{0}));
+    sources = {3};
     auto multi = real.batch_get_into_multi_buffers_internal(
-        {"a"}, {{buffer, buffer + 4}}, {{4, 4}}, false);
+        {"a"}, {{buffer, buffer + 4}}, {{4, 4}}, false, &sources);
     ASSERT_FALSE(multi[0]);
     EXPECT_EQ(multi[0].error(), ErrorCode::CHECKSUM_MISMATCH);
+    EXPECT_EQ(sources, (std::vector<int>{0}));
     const auto totals = *real.get_io_stats_snapshot().ssd_to_host_fetch;
     EXPECT_EQ(totals.batches, 2);
     EXPECT_EQ(totals.bytes, 16);

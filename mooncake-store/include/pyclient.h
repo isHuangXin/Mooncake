@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "client_service.h"
@@ -211,6 +212,16 @@ class ClientRequester {
         const std::string &client_addr, Args &&...args);
 };
 
+// FLAT_MEMORY: per-key sources of a successfully completed host read. These
+// describe the storage source, not a staging buffer or the destination. A mask
+// of 3 is valid only when both sources actually contributed to a successful read.
+// LOCAL_DISK includes the offload owner's SSD, even when that owner is remote.
+enum HostReadSourceMask : int {
+    kReadSourceUnknown = 0,
+    kReadSourceMemory = 1,
+    kReadSourceLocalDisk = 2,
+};
+
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
@@ -277,6 +288,32 @@ class PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node) = 0;
+
+    // FLAT_MEMORY: same arguments, ordering and results as the legacy APIs,
+    // plus per-key HostReadSourceMask values. Failed or unproven reads are
+    // UNKNOWN (also duplicate keys, zero-byte reads and unsupported sources
+    // such as NOF/DISK/DFS in RealClient). Defaults preserve existing subclasses
+    // (including DummyClient) without claiming unreported sources.
+    virtual std::pair<std::vector<int64_t>, std::vector<int>>
+    batch_get_into_with_sources(const std::vector<std::string> &keys,
+                                const std::vector<void *> &buffers,
+                                const std::vector<size_t> &sizes) {
+        auto results = batch_get_into(keys, buffers, sizes);
+        std::vector<int> sources(results.size(), kReadSourceUnknown);
+        return {std::move(results), std::move(sources)};
+    }
+
+    virtual std::pair<std::vector<int>, std::vector<int>>
+    batch_get_into_multi_buffers_with_sources(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node) {
+        auto results = batch_get_into_multi_buffers(
+            keys, all_buffers, all_sizes, prefer_same_node);
+        std::vector<int> sources(results.size(), kReadSourceUnknown);
+        return {std::move(results), std::move(sources)};
+    }
 
     virtual int put_from(const std::string &key, void *buffer, size_t size,
                          const ReplicateConfig &config = ReplicateConfig{}) = 0;

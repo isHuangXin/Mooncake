@@ -446,6 +446,22 @@ inline QueryResult FilterQueryResult(const QueryResult &qr,
         include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 
+// FLAT_MEMORY: legacy batches use key-indexed slice maps and can coalesce
+// duplicate keys. Preserve their results, but do not claim each destination was
+// independently filled. This affects reporting only, never read execution.
+inline void clear_duplicate_read_sources(const std::vector<std::string> &keys,
+                                          std::vector<int> &source_masks) {
+    std::unordered_map<std::string, size_t> first_index;
+    first_index.reserve(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto [it, inserted] = first_index.emplace(keys[i], i);
+        if (!inserted) {
+            source_masks[it->second] = kReadSourceUnknown;
+            source_masks[i] = kReadSourceUnknown;
+        }
+    }
+}
+
 // Shared object-byte range overflow check (same semantics as
 // execute_ranged_read / session ranged get-put).
 inline bool is_object_range_overflow(size_t offset, size_t size, size_t limit) {
@@ -4720,10 +4736,32 @@ int RealClient::upsert_batch(const std::vector<std::string> &keys,
 std::vector<int64_t> RealClient::batch_get_into(
     const std::vector<std::string> &keys, const std::vector<void *> &buffers,
     const std::vector<size_t> &sizes) {
+    return batch_get_into_impl(keys, buffers, sizes, nullptr);
+}
+
+// FLAT_MEMORY: source masks are local to this call, never global last-read state.
+std::pair<std::vector<int64_t>, std::vector<int>>
+RealClient::batch_get_into_with_sources(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes) {
+    std::vector<int> source_masks;
+    auto results = batch_get_into_impl(keys, buffers, sizes, &source_masks);
+    clear_duplicate_read_sources(keys, source_masks);
+    return {std::move(results), std::move(source_masks)};
+}
+
+std::vector<int64_t> RealClient::batch_get_into_impl(
+    const std::vector<std::string> &keys, const std::vector<void *> &buffers,
+    const std::vector<size_t> &sizes, std::vector<int> *source_masks) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
-            [&]() { return batch_get_into_internal(keys, buffers, sizes); },
-            [](const auto &) { return true; },
+            [&]() {
+                return batch_get_into_internal(keys, buffers, sizes,
+                                               source_masks);
+            },
+            // FLAT_MEMORY: preserve INVALID_PARAMS before setup; no metrics
+            // receiver exists in that case.
+            [&](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int64_t> py_results;
                 py_results.reserve(ret.size());
@@ -5114,7 +5152,10 @@ RealClient::get_into_ranges_shm_helper(
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
-                                    const std::vector<size_t> &sizes) {
+                                    const std::vector<size_t> &sizes,
+                                    std::vector<int> *source_masks) {
+    // FLAT_MEMORY: failures and paths without completion evidence stay UNKNOWN.
+    if (source_masks) source_masks->assign(keys.size(), kReadSourceUnknown);
     [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
@@ -5291,6 +5332,12 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
             } else if (op.query_result.replicas.front().is_memory_replica()) {
+                // FLAT_MEMORY: BatchGet completed transfer, checksum and lease
+                // checks. FilterQueryResult pins the only replica to MEMORY;
+                // local hot-cache/memcpy and transport paths are all MEMORY.
+                if (source_masks && op.total_size > 0) {
+                    (*source_masks)[op.original_index] = kReadSourceMemory;
+                }
                 // FLAT_MEMORY: valid_operations also contains NoF in v0.3.13.
                 dram_read_total_bytes += op.total_size;
                 dram_read_success_ops++;
@@ -5430,6 +5477,11 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
             } else {
+                // FLAT_MEMORY: owner SSD read (local arena or RPC), transfer,
+                // TTL and checksum all succeeded. Staging DRAM is not a source.
+                if (source_masks && op.total_size > 0) {
+                    (*source_masks)[op.original_index] = kReadSourceLocalDisk;
+                }
                 // FLAT_MEMORY: count only reads accepted by upstream checks.
                 ssd_read_total_bytes += op.total_size;
                 ++ssd_read_success_ops;
@@ -6200,13 +6252,38 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     bool prefer_alloc_in_same_node) {
+    return batch_get_into_multi_buffers_impl(
+        keys, all_buffers, all_sizes, prefer_alloc_in_same_node, nullptr);
+}
+
+// FLAT_MEMORY: the first tuple member retains the legacy multi-buffer values.
+std::pair<std::vector<int>, std::vector<int>>
+RealClient::batch_get_into_multi_buffers_with_sources(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    bool prefer_alloc_in_same_node) {
+    std::vector<int> source_masks;
+    auto results = batch_get_into_multi_buffers_impl(
+        keys, all_buffers, all_sizes, prefer_alloc_in_same_node, &source_masks);
+    clear_duplicate_read_sources(keys, source_masks);
+    return {std::move(results), std::move(source_masks)};
+}
+
+std::vector<int> RealClient::batch_get_into_multi_buffers_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    bool prefer_alloc_in_same_node, std::vector<int> *source_masks) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<int64_t, ErrorCode>>>(
             [&]() {
                 return batch_get_into_multi_buffers_internal(
-                    keys, all_buffers, all_sizes, prefer_alloc_in_same_node);
+                    keys, all_buffers, all_sizes, prefer_alloc_in_same_node,
+                    source_masks);
             },
-            [](const auto &) { return true; },
+            // FLAT_MEMORY: do not dereference an uninitialized metrics client.
+            [&](const auto &) { return client_ != nullptr; },
             [&](uint64_t latency_us, const auto &ret) {
                 std::vector<int> py_results;
                 py_results.reserve(ret.size());
@@ -6223,6 +6300,11 @@ std::vector<int> RealClient::batch_get_into_multi_buffers(
 
     for (const auto &result : internal_results) {
         results.push_back(to_py_ret(result));
+        // FLAT_MEMORY: retain legacy int conversion, but never label a negative
+        // public result as a proven success (including narrowing overflow).
+        if (source_masks && results.back() < 0) {
+            (*source_masks)[results.size() - 1] = kReadSourceUnknown;
+        }
     }
     return results;
 }
@@ -6232,7 +6314,9 @@ RealClient::batch_get_into_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    bool prefer_alloc_in_same_node) {
+    bool prefer_alloc_in_same_node, std::vector<int> *source_masks) {
+    // FLAT_MEMORY: caller-owned provenance, including all early error paths.
+    if (source_masks) source_masks->assign(keys.size(), kReadSourceUnknown);
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -6313,6 +6397,11 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
+        // FLAT_MEMORY: both APIs reject malformed rows before indexing sizes.
+        if (all_buffers[i].size() != sizes.size()) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
             dst_total_size += size;
@@ -6393,6 +6482,11 @@ RealClient::batch_get_into_multi_buffers_internal(
                 LOG(ERROR) << "BatchGet failed for key '" << op.key
                            << "': " << toString(error);
                 results[op.original_index] = tl::unexpected(error);
+            } else if (source_masks && op.total_size > 0 &&
+                       op.query_result.replicas.front().is_memory_replica()) {
+                // FLAT_MEMORY: the filtered MEMORY transfer (including hot
+                // cache and prefer_same_node) completed, not merely queried.
+                (*source_masks)[op.original_index] = kReadSourceMemory;
             }
         }
     }
@@ -6468,6 +6562,11 @@ RealClient::batch_get_into_multi_buffers_internal(
                     if (!checksum_result) {
                         results[op.original_index] =
                             tl::make_unexpected(checksum_result.error());
+                    } else if (source_masks && op.total_size > 0) {
+                        // FLAT_MEMORY: local-arena/RPC completion plus checksum;
+                        // the owner's staging buffers do not add a MEMORY bit.
+                        (*source_masks)[op.original_index] =
+                            kReadSourceLocalDisk;
                     }
                 }
             }

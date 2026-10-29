@@ -191,6 +191,12 @@ class RealClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    // FLAT_MEMORY: preserve legacy results; report only completed read sources.
+    std::pair<std::vector<int64_t>, std::vector<int>> batch_get_into_with_sources(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers,
+        const std::vector<size_t> &sizes) override;
+
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
      * keys
@@ -209,6 +215,14 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         bool prefer_same_node);
+
+    // FLAT_MEMORY: no normalization of the legacy multi-buffer result values.
+    std::pair<std::vector<int>, std::vector<int>>
+    batch_get_into_multi_buffers_with_sources(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node) override;
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
@@ -676,16 +690,19 @@ class RealClient : public PyClient {
         const std::vector<size_t> *buffer_capacities = nullptr,
         const QueryResultCache *query_result_cache = nullptr);
 
+    // FLAT_MEMORY: optional call-owned output, reset to UNKNOWN before any
+    // validation and populated only after successful completion/checksums.
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
         const std::vector<std::string> &keys,
-        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        std::vector<int> *source_masks = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        bool prefer_same_node);
+        bool prefer_same_node, std::vector<int> *source_masks = nullptr);
 
     tl::expected<void, ErrorCode> put_from_internal(
         const std::string &key, void *buffer, size_t size,
@@ -1113,6 +1130,17 @@ class RealClient : public PyClient {
     virtual device::MemoryKind ssd_fetch_memory_kind(const void* ptr) const;
 
    private:
+    // FLAT_MEMORY: shared wrappers retain legacy conversion and metrics.
+    std::vector<int64_t> batch_get_into_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        std::vector<int> *source_masks);
+    std::vector<int> batch_get_into_multi_buffers_impl(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node, std::vector<int> *source_masks);
+
     SsdToHostFetchStats ssd_to_host_fetch_stats_;
     // Resolve passive classifier availability at construction, never at scrape.
     const bool ssd_fetch_host_classification_available_;

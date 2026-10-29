@@ -662,17 +662,23 @@ TEST_F(RealClientTest, GetWithLeaseTimeOut) {
                   << num_slices << " keys failed";
         ASSERT_NE(fail_count, 0) << "Should fail for some keys";
 
-        // Test Batch Get operation using batch_get_into
-        std::vector<int64_t> bytes_read_results;
+        // FLAT_MEMORY: accepted memory reads report MEMORY; expired leases and
+        // other failed operations must not inherit the queried replica's source.
+        std::pair<std::vector<int64_t>, std::vector<int>> read_results;
         {
             GLogMuter muter;
-            bytes_read_results =
-                py_client_->batch_get_into(keys, buffers, sizes);
+            read_results =
+                py_client_->batch_get_into_with_sources(keys, buffers, sizes);
         }
+        const auto &[bytes_read_results, source_masks] = read_results;
         ASSERT_EQ(bytes_read_results.size(), num_slices)
             << "Should return results for all keys";
+        ASSERT_EQ(source_masks.size(), num_slices);
         fail_count = 0;
         for (size_t i = 0; i < bytes_read_results.size(); ++i) {
+            EXPECT_EQ(source_masks[i], bytes_read_results[i] > 0
+                                           ? kReadSourceMemory
+                                           : kReadSourceUnknown);
             if (bytes_read_results[i] < 0) {
                 fail_count++;
             }
@@ -1051,8 +1057,11 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     for (auto result : results) {
         EXPECT_EQ(result, 0) << "Put operation should succeed";
     }
-    std::vector<int> get_results = py_client_->batch_get_into_multi_buffers(
-        keys, all_dst_ptrs, all_sizes, true);
+    // FLAT_MEMORY: same-node batching retains legacy values and MEMORY sources.
+    auto [get_results, source_masks] =
+        py_client_->batch_get_into_multi_buffers_with_sources(
+            keys, all_dst_ptrs, all_sizes, true);
+    EXPECT_EQ(source_masks, std::vector<int>(keys.size(), kReadSourceMemory));
     for (auto result : get_results) {
         EXPECT_EQ(result, 100) << "Get operation should succeed";
     }

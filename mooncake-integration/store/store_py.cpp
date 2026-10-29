@@ -2859,6 +2859,26 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into pre-allocated buffers for "
             "multiple "
             "keys")
+        // FLAT_MEMORY: source-aware host reads use the same zero-copy inputs.
+        .def(
+            "batch_get_into_with_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<uintptr_t> &buffer_ptrs,
+               const std::vector<size_t> &sizes) {
+                std::vector<void *> buffers;
+                buffers.reserve(buffer_ptrs.size());
+                for (uintptr_t ptr : buffer_ptrs) {
+                    buffers.push_back(reinterpret_cast<void *>(ptr));
+                }
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_with_sources(keys, buffers,
+                                                                sizes);
+            },
+            py::arg("keys"), py::arg("buffer_ptrs"), py::arg("sizes"),
+            "Return (legacy_results, source_masks) in key order. Sources: "
+            "UNKNOWN=0, MEMORY=1, LOCAL_DISK=2; failures/unproven reads are 0. "
+            "LOCAL_DISK includes remote offload owners, not staging memory.")
         .def(
             "put_from",
             [](MooncakeStorePyWrapper &self, const std::string &key,
@@ -3026,6 +3046,25 @@ PYBIND11_MODULE(store, m) {
             "Get object data directly into multiple pre-allocated buffers for "
             "multiple "
             "keys")
+        // FLAT_MEMORY: no changes to legacy multi-buffer return semantics.
+        .def(
+            "batch_get_into_multi_buffers_with_sources",
+            [](MooncakeStorePyWrapper &self,
+               const std::vector<std::string> &keys,
+               const std::vector<std::vector<uintptr_t>> &all_buffer_ptrs,
+               const std::vector<std::vector<size_t>> &all_sizes,
+               bool prefer_alloc_in_same_node = false) {
+                py::gil_scoped_release release;
+                return self.store_->batch_get_into_multi_buffers_with_sources(
+                    keys, CastAddrs2Ptrs(all_buffer_ptrs), all_sizes,
+                    prefer_alloc_in_same_node);
+            },
+            py::arg("keys"), py::arg("all_buffer_ptrs"), py::arg("all_sizes"),
+            py::arg("prefer_alloc_in_same_node") = false,
+            "Return (legacy_results, source_masks) in key order. Sources: "
+            "UNKNOWN=0, MEMORY=1, LOCAL_DISK=2; failures/unproven reads are 0. "
+            "A mask of 3 requires successful data from both sources, not "
+            "multiple available replicas or SSD staging buffers.")
         .def(
             "batch_get_session_start",
             [](MooncakeStorePyWrapper &self,
