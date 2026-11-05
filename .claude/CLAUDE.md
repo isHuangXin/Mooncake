@@ -1,33 +1,31 @@
-# Mooncake — Flat Memory System 子项目规范
+# Mooncake — FlatCake 子项目规范
 
 ## Author
 
 Xin Huang — [@isHuangXin](https://github.com/isHuangXin)
 
-> 本文档是 Mooncake 在 KVCache Flat Memory System 项目中的开发规范。
-> 上层规范: `../../../.claude/CLAUDE.md`
-> 基线: Mooncake `upstream-v0.3.13`；定制分支: `upstream-v0.3.13-flatcake-b200`。
-> 以下保留 v0.3.10 项目规范作为背景；代码行号、数据格式和接口细节以 v0.3.13 实现为准。
-> 本次仅迁移六个 Flatcake 提交，不改造上游分配、淘汰或传输架构。
+> 本文档是 Mooncake 在 FlatCake 项目中的开发规范。上层规范：`../../../.claude/CLAUDE.md`。
+> 基线 `upstream-v0.3.13`；定制分支 `upstream-v0.3.13-flatcake-b200`。
+> 代码行号、数据格式与接口细节均以 v0.3.13 实现为准。
+> 只迁移 Flatcake 所需提交，不改造上游分配、淘汰或传输架构。
 
 ---
 
 ## 0. 本文档范围
 
-本文档仅规范 Mooncake 在 Flat Memory System 项目中涉及的模块。Mooncake 的通用 API 用法请参考 `.claude/skills/mooncake-api/SKILL.md`。
+仅规范 Mooncake 在 FlatCake 项目中涉及的模块。通用 API 用法见 `mooncake-api` skill。
 
 ---
 
-## 1. Mooncake 在 Flat Memory 项目中的角色
+## 1. Mooncake 的两个角色
 
-Mooncake 是 KVCache 分布式存储引擎，在 Flat Memory 项目中承担：
-
-| 职责 | 说明 |
+| 角色 | 说明 |
 |------|------|
-| **KVCache 分布式存储** | 通过 MooncakeDistributedStore 提供 KVCache 的 Put/Get/Exists 操作 |
-| **RDMA 数据传输** | 通过 TransferEngine 实现 GPU HBM 间的零拷贝 RDMA 传输 |
-| **SSD 持久化** | DRAM 满时通过 LRU 淘汰将冷数据异步写入 SSD |
-| **元数据管理** | Master 节点维护全局 KVCache 元数据索引，路由数据访问请求 |
+| **对比基线（主要）** | 提供论文中的 tiered HBM–DRAM–SSD 层级，对应实验 `experiment_4_with_l3_mooncake_ssd` 与 `experiment_5_with_l3_mooncake_ssd_gds`（Mooncake-GDS）。基线机制与失效原因见 [`mooncake-tiered-baseline.md`](../../../.claude/mooncake-tiered-baseline.md) |
+| **RDMA TransferEngine 提供方** | FlatCake 原生 `RDMABackend` 链接 Mooncake `transfer_engine`，用于跨节点 DRAM。主仓库 `USE_RDMA=ON` 时以 CMake 子项目构建（`WITH_TE=ON`、`WITH_STORE=OFF`） |
+
+> FlatCake 自身**不经过** MooncakeStore 存储 KV —— 它走 SGLang 的 `HiCacheStorage`
+> 接口直连原生 Flat 后端。Mooncake store 路径只在基线实验中使用。
 
 ---
 
@@ -35,14 +33,20 @@ Mooncake 是 KVCache 分布式存储引擎，在 Flat Memory 项目中承担：
 
 ### 2.1 存储引擎 (mooncake-store)
 
-| 文件 | 说明 | Flat Memory 改动点 |
-|------|------|-------------------|
-| `mooncake-store/src/real_client.cpp` | RealClient 核心 — 实现 batch_put/batch_get 逻辑 | Flat Memory 需要改造分配策略 |
-| `mooncake-store/src/real_client.cpp:1932` | `batch_get_into_internal()` — 判断数据在 DRAM 还是 SSD 并分流 | SSD 取回路径的入口 |
-| `mooncake-store/src/real_client.cpp:2724` | `batch_get_into_offload_object_internal()` — 从 SSD 读取 KVCache | RPC + TransferEngine 读回 |
-| `mooncake-store/include/allocation_strategy.h` | 分配策略接口 | Flat Memory 需要替换为统一编址策略 |
-| `mooncake-store/include/eviction_strategy.h` | LRU/FIFO 淘汰策略 | Flat Memory 不使用淘汰，需要绕过或禁用 |
-| `mooncake-store/include/file_storage.h` | SSD 文件存储接口 | Flat Memory 可能需要替换 I/O 方式 (io_uring) |
+> 行号随上游变动，按符号名 grep，不要依赖记录的行号。
+
+| 文件 / 符号 | 说明 |
+|------|------|
+| `mooncake-store/src/real_client.cpp` | RealClient 核心 — batch_put/batch_get 逻辑 |
+| `RealClient::batch_get_into_internal()` | 判断数据在 DRAM 还是 SSD 并分流 — SSD 取回路径入口 |
+| `batch_get_into_offload_object_internal()` | 从 SSD 读取 KVCache（RPC + TransferEngine 读回） |
+| `mooncake-store/include/allocation_strategy.h` | 分配策略接口 |
+| `mooncake-store/include/eviction_strategy.h` | LRU/FIFO 淘汰策略 — 基线的 SSD 落盘触发源 |
+| `mooncake-store/include/file_storage.h` | SSD 文件存储接口 |
+
+基线实验新增的遥测（见 §7）：per-key read provenance、SSD I/O 快照与 100 ms
+completion bucket、`MOONCAKE_PARALLEL_READ` 开关与 O_DIRECT 对齐串行回退、
+DRAM/SSD 读写带宽累计统计。这些用于与 FlatCake 对齐口径，不改变基线分层语义。
 
 ### 2.2 传输引擎 (mooncake-transfer-engine)
 
@@ -81,9 +85,7 @@ Mooncake 写入 SSD 的 KVCache 使用自描述格式：
 
 ---
 
-## 4. KVCache 数据流
-
-### 4.1 Tiered Memory 基线（当前实现）
+## 4. KVCache 数据流（基线）
 
 ```
 KVCache 写入:
@@ -106,22 +108,9 @@ SSD -> DRAM 取回:
       -> TransferEngine 传回调用方
 ```
 
-### 4.2 Flat Memory 目标
-
-```
-KVCache 写入:
-  FlatMemoryManager.Put(key, data, size)
-      -> PlacementStrategy 选择目标段 (DRAM/SSD, local/remote)
-      -> StorageBackend.Write() 写入目标介质
-      -> 统一索引更新
-
-KVCache 读取:
-  FlatMemoryManager.Get(key)
-      -> 查询内存索引 (block_index_)
-      -> Resolve 地址 -> 确定在哪个 StorageBackend
-      -> StorageBackend.Read() 直接读取
-      -> 无需 DRAM->SSD 迁移
-```
+> 这条路径上有两处构成论文 §2.2 Observation 2 的代价：SSD 命中必须先落到临时 DRAM
+> buffer 再传回（host staging 争用），且 SSD 空间按淘汰增量填充、按 FIFO bucket 回收
+> （同会话前缀散落在非连续 LBA）。FlatCake 的对应做法见上层 `CLAUDE.md` §2。
 
 ---
 
@@ -174,16 +163,20 @@ freeBatchID(engine, batch);
 | `MC_MS_FILTERS` | RDMA 设备过滤 (如 "mlx5_0") | 全部设备 |
 | `MC_STORE_USE_HUGEPAGE` | 启用 Hugepage | false |
 | `MC_STORE_MEMCPY` | 启用本地 memcpy 优化 | false |
+| `MOONCAKE_PARALLEL_READ` | 并行 SSD 读；关闭时走 O_DIRECT 对齐串行回退 | — |
 
 ---
 
 ## 7. 代码修改约束
 
-- Mooncake 代码修改在 `third_party/mooncake/` 中进行
-- 修改必须与顶层 CLAUDE.md 和 SGLang CLAUDE.md 保持一致
-- 所有 Flat Memory 相关修改需标注 `// FLAT_MEMORY:` 注释前缀
-- Mooncake 的核心传输引擎（RDMA 路径）不得修改，仅扩展存储层和分配策略
-- C++ 代码遵循 Mooncake 现有风格（参考 `.clang-format`）
+- Mooncake 代码修改留在 `third_party/mooncake/`，不要混进主仓库或 SGLang 子模块
+- 修改必须与顶层 `CLAUDE.md` 和 SGLang 子项目规范保持一致
+- 所有 Flatcake 相关修改标注 `// FLAT_MEMORY:` 注释前缀
+- 核心传输引擎（RDMA 路径）不得修改；基线侧只做遥测扩展
+- **不要为了提升基线表现而改掉分层语义** —— 基线必须保持 LRU 淘汰落盘、host staging
+  恢复与 FIFO bucket 回收，否则论文的对比失去意义
+- C++ 代码遵循 Mooncake 现有风格（`.clang-format`）
+- 该子模块的上游 PR 约定见 `AGENTS.md`（仓库根的 `CLAUDE.md` 即指向它）
 
 ---
 
@@ -191,8 +184,8 @@ freeBatchID(engine, batch);
 
 | 文档 | 说明 |
 |------|------|
-| [顶层规范](../../../.claude/CLAUDE.md) | Flat Memory System 项目总规范 |
-| [Issues 跟踪](../../../.claude/issues.md) | 待解决问题清单 |
-| [Mooncake API Skill](.claude/skills/mooncake-api/SKILL.md) | Mooncake Python API 完整参考 |
-| [Ghost Node 分析](../../../experiments/experiment_4_single_node_Flat_Memory/ghost_node_and_ssd_kvcache_reuse_analysis.md) | SSD KVCache 取回路径分析 |
-| [Mooncake 官方文档](https://kvcache-ai.github.io/Mooncake/) | Mooncake 完整文档 |
+| [顶层规范](../../../.claude/CLAUDE.md) | FlatCake 项目总规范 |
+| [Tiered 基线说明](../../../.claude/mooncake-tiered-baseline.md) | 基线机制与失效原因（论文 §2.2） |
+| [SGLang 子项目规范](../../sglang/.claude/CLAUDE.md) | SGLang 侧接入点与不变量 |
+| `mooncake-api` skill | Mooncake Python API 完整参考 |
+| [Mooncake 官方文档](https://kvcache-ai.github.io/Mooncake/) | 上游完整文档 |
