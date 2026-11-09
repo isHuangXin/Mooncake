@@ -467,20 +467,12 @@ TEST(SsdKvIoCompletionTest, StaleTagsKeepOriginalSourceAndSharedLifetime) {
 #ifdef USE_URING
 TEST(SsdKvIoCompletionTest, DescriptorsHaveOptionalObserverAndDirection) {
     UringFile::ReadDesc read{};
-    UringFile::ReadDescMultiFd multi{};
-    UringFile::WriteDesc write{};
     EXPECT_FALSE(read.io_observer);
-    EXPECT_FALSE(multi.io_observer);
-    EXPECT_FALSE(write.io_observer);
     EXPECT_EQ(read.direction, SsdKvIoDirection::Read);
-    EXPECT_EQ(multi.direction, SsdKvIoDirection::Read);
-    EXPECT_EQ(write.direction, SsdKvIoDirection::Write);
-    // Async copies and read-shaped write completion buffers cannot determine
-    // direction by their C++ shape; the explicit SQE observation does that.
-    write.io_observer = std::make_shared<SsdKvIoStats>();
-    auto async_copy = multi;
-    async_copy.io_observer = write.io_observer;
-    EXPECT_EQ(async_copy.io_observer, write.io_observer);
+    auto observer = std::make_shared<SsdKvIoStats>();
+    auto read_copy = read;
+    read_copy.io_observer = observer;
+    EXPECT_EQ(read_copy.io_observer, observer);
 }
 #endif
 
@@ -569,21 +561,11 @@ TEST_F(StorageBackendTest,
         return objects;
     };
     auto notify = [](const auto&, auto&) { return ErrorCode::OK; };
-    ASSERT_TRUE(backend.BatchOffload(batch("serial"), notify));
+    ASSERT_TRUE(backend.BatchOffload(batch("first"), notify));
     EXPECT_EQ(stats->buckets_completed(), 1);
-    std::vector<BucketStorageBackend::PreparedBucket> prepared;
-    auto result = backend.PrepareBatchOffload(batch("parallel"));
-    ASSERT_TRUE(result);
-    prepared.push_back(std::move(*result));
-    EXPECT_EQ(stats->buckets_completed(), 1);  // preparation is not I/O success
-    ASSERT_TRUE(backend.FlushPreparedBuckets(prepared));
+    ASSERT_TRUE(backend.BatchOffload(batch("second"), notify));
     EXPECT_EQ(stats->buckets_completed(), 2);
-    EXPECT_FALSE(backend.CommitBucket(prepared[0], [](const auto&, auto&) {
-        return ErrorCode::RPC_FAIL;
-    }));
-    prepared.clear();
     // Notify/rollback cannot subtract the completed event.
-    EXPECT_EQ(stats->buckets_completed(), 2);
     EXPECT_FALSE(backend.BatchOffload(batch("notify-failed"),
                                      [](const auto&, auto&) {
                                          return ErrorCode::RPC_FAIL;
@@ -595,9 +577,9 @@ TEST_F(StorageBackendTest,
 }
 
 TEST_F(StorageBackendTest, IoDataSyncedBucketsFailuresDoNotCount) {
+    // Upstream POSIX bucket writes do not datasync, so kDataSync is not hit.
     for (auto failure : {BucketIoFailure::kDataWrite,
                          BucketIoFailure::kShortData,
-                         BucketIoFailure::kDataSync,
                          BucketIoFailure::kMetadata}) {
         FileStorageConfig config;
         config.storage_filepath = data_path + "/failure-" +
@@ -615,61 +597,6 @@ TEST_F(StorageBackendTest, IoDataSyncedBucketsFailuresDoNotCount) {
             return ErrorCode::OK;
         }));
         EXPECT_EQ(stats->buckets_completed(), 0);
-        auto p = backend.PrepareBatchOffload(objects);
-        ASSERT_TRUE(p);
-        std::vector<BucketStorageBackend::PreparedBucket> prepared;
-        prepared.push_back(std::move(*p));
-        EXPECT_FALSE(backend.FlushPreparedBuckets(prepared));
-        EXPECT_EQ(stats->buckets_completed(), 0);
-    }
-}
-
-TEST_F(StorageBackendTest, IoDataSyncedBucketsPartialFlushRetainsCompleted) {
-    for (auto failure : {BucketIoFailure::kDataWrite,
-                         BucketIoFailure::kShortData,
-                         BucketIoFailure::kDataSync,
-                         BucketIoFailure::kMetadata}) {
-        FileStorageConfig config;
-        config.storage_filepath = data_path + "/partial-" +
-                                  std::to_string(static_cast<int>(failure));
-        fs::create_directories(config.storage_filepath);
-        config.use_uring = false;
-        auto stats = std::make_shared<SsdDataSyncedStats>();
-        BucketIoTestBackend backend(config, stats);
-        ASSERT_TRUE(backend.Init());
-        backend.failure = failure;
-        std::string value(128, 'x');
-        std::vector<BucketStorageBackend::PreparedBucket> prepared;
-        for (int i = 0; i < 3; ++i) {
-            auto p = backend.PrepareBatchOffload(
-                {{std::to_string(i), {{value.data(), value.size()}}}});
-            ASSERT_TRUE(p);
-            prepared.push_back(std::move(*p));
-        }
-        backend.fail_bucket = prepared[1].bucket_id;
-        // Files capture data fault selection when opened during prepare.
-        // Replace file wrappers for a deterministic failure in bucket 1 only.
-        if (failure != BucketIoFailure::kMetadata) {
-            for (size_t i = 0; i < prepared.size(); ++i) {
-                auto& p = prepared[i];
-                auto replacement = std::make_unique<BucketIoTestFile>(
-                    p.bucket_data_path, dup(p.fd),
-                    i == 1 ? failure : BucketIoFailure::kNone, false);
-                p.file = std::move(replacement);
-                p.fd = p.file->fd();
-            }
-        }
-        EXPECT_FALSE(backend.FlushPreparedBuckets(prepared));
-        // All data writes precede any sync/metadata work in the existing path.
-        const uint64_t completed = failure == BucketIoFailure::kDataSync ||
-                                           failure == BucketIoFailure::kMetadata
-                                       ? 1 : 0;
-        EXPECT_EQ(stats->buckets_completed(), completed);
-        prepared.clear();  // failed batch cleanup must not reset the event
-        EXPECT_EQ(stats->buckets_completed(), completed);
-        std::vector<BucketStorageBackend::PreparedBucket> empty;
-        ASSERT_TRUE(backend.FlushPreparedBuckets(empty));
-        EXPECT_EQ(stats->buckets_completed(), completed);
     }
 }
 

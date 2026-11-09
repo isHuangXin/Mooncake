@@ -45,8 +45,9 @@ Xin Huang — [@isHuangXin](https://github.com/isHuangXin)
 | `mooncake-store/include/file_storage.h` | SSD 文件存储接口 |
 
 基线实验新增的遥测（见 §7）：per-key read provenance、SSD I/O 快照与 100 ms
-completion bucket、`MOONCAKE_PARALLEL_READ` 开关与 O_DIRECT 对齐串行回退、
-DRAM/SSD 读写带宽累计统计。这些用于与 FlatCake 对齐口径，不改变基线分层语义。
+completion bucket、DRAM/SSD 读写带宽累计统计。这些用于与 FlatCake 对齐口径，不改变基线分层语义。
+SSD 读路径（`BucketStorageBackend::BatchLoad`）保持上游实现：按 bucket 逐个读，
+每个 bucket 内一次 io_uring 批量提交（`QUEUE_DEPTH=32`），没有跨 bucket 并行和读线程池。
 
 ### 2.2 传输引擎 (mooncake-transfer-engine)
 
@@ -163,7 +164,6 @@ freeBatchID(engine, batch);
 | `MC_MS_FILTERS` | RDMA 设备过滤 (如 "mlx5_0") | 全部设备 |
 | `MC_STORE_USE_HUGEPAGE` | 启用 Hugepage | false |
 | `MC_STORE_MEMCPY` | 启用本地 memcpy 优化 | false |
-| `MOONCAKE_PARALLEL_READ` | 并行 SSD 读；关闭时走 O_DIRECT 对齐串行回退 | — |
 
 ---
 

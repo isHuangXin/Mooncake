@@ -21,7 +21,6 @@
 #include <chrono>
 #include <iomanip>
 #include <unordered_set>
-#include <future>  // P5: for thread-pool read results
 
 #include <ylt/struct_pb.hpp>
 
@@ -1742,8 +1741,21 @@ BucketStorageBackend::BucketStorageBackend(
 #endif
       storage_path_(file_storage_config_.storage_filepath),
       bucket_backend_config_(bucket_backend_config_) {
-    // MOONCAKE_SSD_OPT: WriteBucket uses a thread_local 32MB buffer;
-    // PrepareWriteBucket keeps a separate buffer per pending bucket.
+    // Allocate aligned buffer for O_DIRECT I/O operations
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
+    if (ret != 0) {
+        LOG(ERROR)
+            << "BucketStorageBackend: Failed to allocate aligned buffer: "
+            << strerror(ret);
+    } else {
+        aligned_io_buffer_.reset(buf);
+        // Update the deleter to use free
+        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
+            buf, [](void* p) { free(p); });
+        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
+                  << " bytes aligned buffer at " << buf;
+    }
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
@@ -2014,322 +2026,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
     // Step 2: Perform IO without holding any locks
-    // FLAT_MEMORY: Multi-level optimization for SSD read bandwidth:
-    //   P1: GetOrOpenFile() — reuse cached fd, avoid open()/close() per call
-    //   P2: batch_read_multi_fd() — submit reads across buckets in one io_uring submission
-    //   P3: QUEUE_DEPTH increased from 32 → 500 for better NVMe utilization
-    //   P5: Multi-threaded parallel reads using pre-created ThreadPool (8 threads)
-    //       - Thread pool reuses threads across calls (avoids io_uring ring init ~150ms)
-    //       - Each thread handles a subset of buckets with batch_read_multi_fd
-    //
-    // Previously: per-key read_aligned() with QD=1 → ~0.26 GB/s
-    // After P0:   per-bucket batch_read() with QD=32 → ~2-3 GB/s
-    // After P1+P2+P3: cross-bucket batch_read_multi_fd() with QD=500 → ~2-3 GB/s
-    // After P5: multi-thread + batch_read_multi_fd → target ~4-6 GB/s
+    // FLAT_MEMORY: upstream v0.3.13 read path (per-bucket io_uring batch,
+    // buckets read one after another); only bandwidth logging is added.
     size_t total_read_bytes = 0;
     auto read_start = std::chrono::steady_clock::now();
-    const char* mode = "serial-per-key";
-
-#ifdef USE_URING
-    // FLAT_MEMORY: default to serial QD=1 reads for the baseline comparison.
-    // Set MOONCAKE_PARALLEL_READ=1 to enable the optimized io_uring paths.
-    static const bool parallel_read =
-        Environ::GetInt("MOONCAKE_PARALLEL_READ", 0) != 0;
-    if (!parallel_read || !file_storage_config_.use_uring) goto serial_fallback;
-
-    // P5: Parallel reads using pre-created thread pool
-    // Each thread handles a subset of buckets with batch_read_multi_fd
-    if (file_storage_config_.use_uring && read_thread_pool_ &&
-        bucket_read_plans.size() > 1) {
-        // Partition buckets across threads
-        std::vector<std::pair<int64_t, std::vector<ReadPlan>*>> bucket_list;
-        bucket_list.reserve(bucket_read_plans.size());
-        for (auto& [bucket_id, plans] : bucket_read_plans) {
-            bucket_list.emplace_back(bucket_id, &plans);
-        }
-
-        // Track per-key alignment info for post-processing (thread-safe via per-thread vectors)
-        struct ThreadResult {
-            std::vector<std::string> keys;
-            std::vector<void*> adjusted_ptrs;
-            std::vector<size_t> data_sizes;
-            size_t bytes_read = 0;
-            ErrorCode error = ErrorCode::OK;
-        };
-
-        const size_t num_threads = std::min(bucket_list.size(), static_cast<size_t>(8));
-        std::vector<std::future<ThreadResult>> futures;
-        futures.reserve(num_threads);
-
-        // Distribute buckets across threads
-        bool any_error = false;
-        ErrorCode first_error = ErrorCode::OK;
-        size_t buckets_per_thread = (bucket_list.size() + num_threads - 1) / num_threads;
-
-        for (size_t t = 0; t < num_threads; ++t) {
-            size_t start_idx = t * buckets_per_thread;
-            size_t end_idx = std::min(start_idx + buckets_per_thread, bucket_list.size());
-            if (start_idx >= bucket_list.size()) break;
-
-            // Capture range of buckets for this thread
-            try {
-                futures.push_back(read_thread_pool_->submit(
-                    [this, &bucket_list, start_idx, end_idx]() -> ThreadResult {
-                        ThreadResult result;
-
-                        std::vector<UringFile::ReadDescMultiFd> descs;
-                        std::vector<std::string> keys;
-                        std::vector<size_t> data_sizes;
-                        std::vector<int64_t> offsets_in_buffer;
-                        // Keep files alive until the batch completes.
-                        std::vector<std::shared_ptr<StorageFile>> files;
-
-                        // Build ReadDesc array for this thread's buckets
-                        for (size_t i = start_idx; i < end_idx; ++i) {
-                            auto& [bucket_id, plans_ptr] = bucket_list[i];
-                            auto& plans = *plans_ptr;
-
-                            auto filepath_res = GetBucketDataPath(bucket_id);
-                            if (!filepath_res) {
-                                result.error = ErrorCode::INTERNAL_ERROR;
-                                return result;
-                            }
-
-                            auto file_res = GetOrOpenFile(filepath_res.value(),
-                                                         FileMode::Read);
-                            if (!file_res) {
-                                result.error = file_res.error();
-                                return result;
-                            }
-                            auto& file = file_res.value();
-                            UringFile* uring_ptr =
-                                dynamic_cast<UringFile*>(file.get());
-                            if (!uring_ptr) {
-                                result.error = ErrorCode::INTERNAL_ERROR;
-                                return result;
-                            }
-                            files.push_back(file);
-
-                            for (const auto& plan : plans) {
-                                int64_t actual_offset =
-                                    plan.offset + plan.key_size;
-                                int64_t a_offset =
-                                    align_down(actual_offset, kDirectIOAlignment);
-                                int64_t data_end = actual_offset +
-                                    static_cast<int64_t>(plan.dest_slice.size);
-                                int64_t a_end = static_cast<int64_t>(align_up(
-                                    static_cast<size_t>(data_end),
-                                    kDirectIOAlignment));
-                                size_t a_size =
-                                    static_cast<size_t>(a_end - a_offset);
-
-                                descs.push_back({uring_ptr->fd(),
-                                                 plan.dest_slice.ptr, a_size,
-                                                 static_cast<off_t>(a_offset)});
-                                // FLAT_MEMORY: share this DATA file's source.
-                                descs.back().io_observer =
-                                    uring_ptr->io_observer();
-                                descs.back().direction = SsdKvIoDirection::Read;
-                                keys.push_back(plan.key);
-                                data_sizes.push_back(plan.dest_slice.size);
-                                offsets_in_buffer.push_back(actual_offset -
-                                                            a_offset);
-                            }
-                        }
-
-                        if (descs.empty()) return result;
-
-                        // Submit batch read for this thread's buckets
-                        auto batch_res = UringFile::batch_read_multi_fd(
-                            descs.data(), static_cast<int>(descs.size()));
-                        if (!batch_res) {
-                            result.error = batch_res.error();
-                            return result;
-                        }
-
-                        // Store results for post-processing
-                        result.keys = std::move(keys);
-                        result.adjusted_ptrs.reserve(descs.size());
-                        result.data_sizes = std::move(data_sizes);
-                        for (size_t i = 0; i < descs.size(); ++i) {
-                            const auto& desc = descs[i];
-                            const size_t min_required =
-                                static_cast<size_t>(offsets_in_buffer[i]) +
-                                result.data_sizes[i];
-                            // FLAT_MEMORY: retain upstream per-key read checks;
-                            // a batch total cannot prove a full read.
-                            if (!desc.completed || desc.error != ErrorCode::OK ||
-                                desc.bytes_read < min_required) {
-                                LOG(ERROR)
-                                    << "batch_read_multi_fd failed for key: "
-                                    << result.keys[i]
-                                    << ", completed=" << desc.completed
-                                    << ", error=" << desc.error
-                                    << ", expected at least=" << min_required
-                                    << ", got=" << desc.bytes_read;
-                                result.error = desc.error != ErrorCode::OK
-                                                   ? desc.error
-                                                   : ErrorCode::FILE_READ_FAIL;
-                                return result;
-                            }
-                            result.adjusted_ptrs.push_back(
-                                static_cast<char*>(desc.buf) +
-                                offsets_in_buffer[i]);
-                            result.bytes_read += desc.bytes_read;
-                        }
-                        return result;
-                    }));
-            } catch (...) {
-                LOG(ERROR) << "Failed to submit parallel bucket read";
-                any_error = true;
-                first_error = ErrorCode::INTERNAL_ERROR;
-                break;
-            }
-        }
-
-        // FLAT_MEMORY: drain every submitted future, including on exceptions,
-        // before read plans, destination buffers or bucket guards can be freed.
-        for (auto& fut : futures) {
-            try {
-                auto result = fut.get();
-                if (result.error != ErrorCode::OK) {
-                    if (!any_error) {
-                        any_error = true;
-                        first_error = result.error;
-                    }
-                    continue;
-                }
-
-                // Update batch_object with adjusted pointers
-                for (size_t i = 0; i < result.keys.size(); ++i) {
-                    batch_object.at(result.keys[i]).ptr = result.adjusted_ptrs[i];
-                }
-                total_read_bytes += result.bytes_read;
-            } catch (...) {
-                LOG(ERROR) << "Parallel bucket read task failed";
-                if (!any_error) {
-                    any_error = true;
-                    first_error = ErrorCode::INTERNAL_ERROR;
-                }
-            }
-        }
-
-        if (any_error) {
-            LOG(ERROR) << "P5 multi-thread read failed, error: " << first_error;
-            return tl::make_unexpected(first_error);
-        }
-    } else {
-        // Single-thread fallback (P1+P2+P3 only) or non-thread-pool path
-        // Track per-key alignment info for post-processing
-        struct AlignedReadInfo {
-            std::string key;           // key in batch_object to adjust ptr
-            size_t data_size;          // original unaligned data size
-            int64_t offset_in_buffer;  // ptr adjustment for O_DIRECT alignment
-        };
-
-        std::vector<UringFile::ReadDescMultiFd> all_descs;
-        std::vector<AlignedReadInfo> all_infos;
-        std::vector<std::shared_ptr<StorageFile>> all_files;  // keep files alive
-        bool all_uring = true;
-
-        // Phase 1: Open files and build cross-bucket ReadDesc array
-        // P1: GetOrOpenFile() reuses cached fds — no open()/close() overhead
-        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
-            auto filepath_res = GetBucketDataPath(bucket_id);
-            if (!filepath_res) {
-                LOG(ERROR) << "Failed to get bucket data path, bucket_id="
-                           << bucket_id;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-
-            // P1: Use GetOrOpenFile for fd caching
-            auto file_res = GetOrOpenFile(filepath_res.value(), FileMode::Read);
-            if (!file_res) {
-                LOG(ERROR) << "Failed to open bucket file: "
-                           << filepath_res.value();
-                return tl::make_unexpected(file_res.error());
-            }
-            auto& file = file_res.value();
-            UringFile* uring_ptr = dynamic_cast<UringFile*>(file.get());
-            if (!uring_ptr) {
-                all_uring = false;
-                break;
-            }
-            all_files.push_back(file);  // keep file alive
-
-            // Build ReadDescMultiFd entries for every key in this bucket
-            for (const auto& plan : read_plans) {
-                int64_t actual_offset = plan.offset + plan.key_size;
-                int64_t a_offset = align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end = actual_offset +
-                                   static_cast<int64_t>(plan.dest_slice.size);
-                int64_t a_end = static_cast<int64_t>(
-                    align_up(static_cast<size_t>(data_end), kDirectIOAlignment));
-                size_t a_size = static_cast<size_t>(a_end - a_offset);
-
-                all_descs.push_back({uring_ptr->fd(), plan.dest_slice.ptr, a_size,
-                                     static_cast<off_t>(a_offset)});
-                // FLAT_MEMORY: descriptors retain ownership through completion.
-                all_descs.back().io_observer = uring_ptr->io_observer();
-                all_descs.back().direction = SsdKvIoDirection::Read;
-                all_infos.push_back({plan.key, plan.dest_slice.size,
-                                     actual_offset - a_offset});
-            }
-        }
-
-        if (all_uring && !all_descs.empty()) {
-            // Phase 2: Submit ALL reads across ALL buckets at once
-            // P3: NVMe sees QD = min(total_keys, 500) per io_uring_submit
-            auto batch_res = UringFile::batch_read_multi_fd(
-                all_descs.data(), static_cast<int>(all_descs.size()));
-            if (!batch_res) {
-                LOG(ERROR) << "batch_read_multi_fd failed, error: "
-                           << batch_res.error();
-                return tl::make_unexpected(batch_res.error());
-            }
-
-            // Phase 3: Post-process — adjust pointers for O_DIRECT alignment
-            for (size_t i = 0; i < all_infos.size(); ++i) {
-                const auto& info = all_infos[i];
-                const auto& desc = all_descs[i];
-                const size_t min_required =
-                    static_cast<size_t>(info.offset_in_buffer) + info.data_size;
-                if (!desc.completed || desc.error != ErrorCode::OK ||
-                    desc.bytes_read < min_required) {
-                    LOG(ERROR) << "batch_read_multi_fd failed for key: "
-                               << info.key << ", completed=" << desc.completed
-                               << ", error=" << desc.error
-                               << ", expected at least=" << min_required
-                               << ", got=" << desc.bytes_read;
-                    return tl::make_unexpected(desc.error != ErrorCode::OK
-                                                   ? desc.error
-                                                   : ErrorCode::FILE_READ_FAIL);
-                }
-                batch_object.at(info.key).ptr =
-                    static_cast<char*>(desc.buf) + info.offset_in_buffer;
-                total_read_bytes += desc.bytes_read;
-            }
-        } else if (!all_uring) {
-            // Fallback: at least one file is not UringFile — use serial path
-            goto serial_fallback;
-        }
-    }
-    mode = (read_thread_pool_ && bucket_read_plans.size() > 1)
-               ? "P5-multithread"
-               : "P1+P2+P3-single";
-    goto read_done;
-
-serial_fallback:
-#endif
-    // FLAT_MEMORY: serial per-key reads with O_DIRECT alignment handling.
-    // Read into an aligned bounce buffer and copy to the caller's destination.
     for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        // Open file for this bucket (cheap syscall, no lock needed)
         auto filepath_res = GetBucketDataPath(bucket_id);
         if (!filepath_res) {
             LOG(ERROR) << "Failed to get bucket data path, bucket_id="
                        << bucket_id;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
         auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
         if (!file_res) {
             LOG(ERROR) << "Failed to open bucket file: "
@@ -2337,55 +2046,103 @@ serial_fallback:
             return tl::make_unexpected(file_res.error());
         }
         auto& file = file_res.value();
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            int64_t a_offset = align_down(actual_offset, kDirectIOAlignment);
-            int64_t data_end =
-                actual_offset + static_cast<int64_t>(plan.dest_slice.size);
-            size_t a_size =
-                align_up(static_cast<size_t>(data_end), kDirectIOAlignment) -
-                static_cast<size_t>(a_offset);
-            size_t offset_in_buffer =
-                static_cast<size_t>(actual_offset - a_offset);
 
-            // Allocate an aligned bounce buffer for this one O_DIRECT read.
-            void* aligned_buf = nullptr;
-            int r = posix_memalign(&aligned_buf, kDirectIOAlignment, a_size);
-            if (r != 0 || !aligned_buf) {
-                LOG(ERROR) << "posix_memalign failed for serial read, key: "
-                           << plan.key << ", size: " << a_size;
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+#ifdef USE_URING
+        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+        if (uring_file != nullptr) {
+            struct BatchReadPlan {
+                const ReadPlan* plan;
+                size_t offset_in_buffer;
+                size_t min_required;
+            };
+
+            std::vector<UringFile::ReadDesc> read_descs;
+            std::vector<BatchReadPlan> batch_read_plans;
+            read_descs.reserve(read_plans.size());
+            batch_read_plans.reserve(read_plans.size());
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
+                int64_t data_end =
+                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t aligned_end = static_cast<int64_t>(align_up(
+                    static_cast<size_t>(data_end), kDirectIOAlignment));
+                size_t aligned_size =
+                    static_cast<size_t>(aligned_end - aligned_offset);
+                size_t offset_in_buffer =
+                    static_cast<size_t>(actual_offset - aligned_offset);
+
+                read_descs.push_back(UringFile::ReadDesc{
+                    plan.dest_slice.ptr, aligned_size, aligned_offset});
+                batch_read_plans.push_back(
+                    BatchReadPlan{&plan, offset_in_buffer,
+                                  offset_in_buffer + plan.dest_slice.size});
             }
 
-            iovec iov{aligned_buf, a_size};
-            auto read_result = file->vector_read(&iov, 1, a_offset);
+            auto batch_read_result = uring_file->batch_read(
+                read_descs.data(), static_cast<int>(read_descs.size()));
+            if (!batch_read_result) {
+                for (size_t i = 0; i < read_descs.size(); ++i) {
+                    if (read_descs[i].error == ErrorCode::OK) continue;
+                    LOG(ERROR)
+                        << "batch_read failed for key: "
+                        << batch_read_plans[i].plan->key
+                        << ", bucket_id=" << batch_read_plans[i].plan->bucket_id
+                        << ", error=" << read_descs[i].error;
+                }
+                return tl::make_unexpected(batch_read_result.error());
+            }
+
+            for (size_t i = 0; i < read_descs.size(); ++i) {
+                const auto& desc = read_descs[i];
+                const auto& batch_plan = batch_read_plans[i];
+                const auto& plan = *batch_plan.plan;
+                if (!desc.completed) {
+                    LOG(ERROR)
+                        << "batch_read did not complete for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (desc.bytes_read < batch_plan.min_required) {
+                    LOG(ERROR)
+                        << "batch_read short read for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id
+                        << ", expected at least: " << batch_plan.min_required
+                        << " (aligned_size=" << desc.len
+                        << ", data_size=" << plan.dest_slice.size
+                        << "), got: " << desc.bytes_read;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                batch_object.at(plan.key).ptr =
+                    static_cast<char*>(plan.dest_slice.ptr) +
+                    batch_plan.offset_in_buffer;
+                total_read_bytes += plan.dest_slice.size;
+            }
+            continue;
+        }
+#endif
+
+        for (const auto& plan : read_plans) {
+            int64_t actual_offset = plan.offset + plan.key_size;
+            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+            auto read_result = file->vector_read(&iov, 1, actual_offset);
             if (!read_result) {
-                free(aligned_buf);
                 LOG(ERROR) << "vector_read failed for key: " << plan.key
                            << ", bucket_id=" << plan.bucket_id
                            << ", error: " << read_result.error();
                 return tl::make_unexpected(read_result.error());
             }
-            if (read_result.value() < offset_in_buffer + plan.dest_slice.size) {
-                free(aligned_buf);
-                LOG(ERROR) << "Read size insufficient for key: " << plan.key
+            if (read_result.value() != plan.dest_slice.size) {
+                LOG(ERROR) << "Read size mismatch for key: " << plan.key
                            << ", expected: " << plan.dest_slice.size
-                           << ", got: " << read_result.value()
-                           << ", offset_in_buffer: " << offset_in_buffer;
+                           << ", got: " << read_result.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
             }
-
-            memcpy(plan.dest_slice.ptr,
-                   static_cast<char*>(aligned_buf) + offset_in_buffer,
-                   plan.dest_slice.size);
-            free(aligned_buf);
             total_read_bytes += plan.dest_slice.size;
         }
     }
-
-#ifdef USE_URING
-read_done:
-#endif
 
     auto read_elapsed_us =
         std::chrono::duration_cast<std::chrono::microseconds>(
@@ -2403,7 +2160,7 @@ read_done:
                   << " MB in " << read_elapsed_us / 1000 << " ms = "
                   << std::setprecision(2) << read_gbps << " GB/s"
                   << " (" << batch_object.size() << " keys, "
-                  << bucket_read_plans.size() << " buckets, " << mode << ")";
+                  << bucket_read_plans.size() << " buckets)";
     }
 
     // bucket_guards go out of scope here, decrementing inflight_reads_
@@ -2651,18 +2408,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
-
-#ifdef USE_URING
-        // P5: Reuse read workers and their thread-local io_uring rings.
-        const int read_parallelism =
-            Environ::GetInt("MOONCAKE_READ_PARALLELISM", 8);
-        if (file_storage_config_.use_uring && read_parallelism > 1) {
-            read_thread_pool_ = std::make_unique<ThreadPool>(read_parallelism);
-            LOG(INFO) << "[MOONCAKE_SSD_OPT] Read thread pool created with "
-                      << read_parallelism << " threads";
-        }
-#endif
-
         initialized_.store(true, std::memory_order_release);
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
@@ -2941,27 +2686,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
         size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-        // MOONCAKE_SSD_OPT: Use thread_local aligned buffer to avoid data
-        // races when multiple offload threads call WriteBucket concurrently.
-        // Each thread lazily allocates its own 32MB buffer on first use.
+        // Allocate aligned buffer if needed
         void* write_buffer = nullptr;
         std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
                                                            [](void*) {}};
 
-        thread_local std::unique_ptr<void, void (*)(void*)>
-            tl_aligned_io_buffer{nullptr, [](void*) {}};
-        if (!tl_aligned_io_buffer) {
-            void* b = nullptr;
-            int r = posix_memalign(&b, kDirectIOAlignment, kAlignedBufferSize);
-            if (r == 0) {
-                tl_aligned_io_buffer = std::unique_ptr<void, void (*)(void*)>(
-                    b, [](void* p) { free(p); });
-            }
-        }
-
-        if (aligned_size <= kAlignedBufferSize && tl_aligned_io_buffer) {
-            // Use the per-thread pre-allocated buffer
-            write_buffer = tl_aligned_io_buffer.get();
+        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
+            // Use the pre-allocated buffer
+            write_buffer = aligned_io_buffer_.get();
         } else {
             // Allocate a temporary larger buffer
             void* buf = nullptr;
@@ -3009,6 +2741,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
+        // Flush bucket data to stable storage before writing metadata.
+        // This prevents a crash from leaving valid metadata pointing at
+        // incomplete data (write-ordering durability guarantee).
+        auto sync_result = uring_file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);
@@ -3038,12 +2779,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             file_cache_.erase(bucket_data_path);
         }
     }
-    // FLAT_MEMORY: preserve data-before-metadata durability for both I/O paths.
-    auto sync_result = file->datasync();
-    if (!sync_result) {
-        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
@@ -3064,290 +2799,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
 
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
-    // FLAT_MEMORY: data write + data sync + metadata write succeeded.
+    // FLAT_MEMORY: telemetry only; data write + metadata write succeeded.
     if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
     return {};
-}
-
-// ---------------------------------------------------------------------------
-// MOONCAKE_SSD_OPT: Two-phase write support
-// ---------------------------------------------------------------------------
-
-// FLAT_MEMORY: one movable owner for reservation and per-bucket rollback.
-void BucketStorageBackend::PreparedBucket::Cleanup::operator()(
-    PendingEviction* pending) const {
-    backend->ReleasePreparedWrite(*pending);
-    if (committed) {
-        backend->RollbackCommittedBucket(bucket_id, pending->write_keys);
-    } else {
-        backend->CleanupOrphanedBucket(bucket_id);
-    }
-    delete pending;
-}
-
-tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
-BucketStorageBackend::PrepareWriteBucket(
-    PreparedBucket prepared, const std::vector<iovec>& iovs) {
-    auto bucket_data_path_res = GetBucketDataPath(prepared.bucket_id);
-    if (!bucket_data_path_res) {
-        LOG(ERROR) << "PrepareWriteBucket: failed to get path, bucket_id="
-                   << prepared.bucket_id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    prepared.bucket_data_path = std::move(bucket_data_path_res.value());
-
-    auto open_file_result = OpenFile(prepared.bucket_data_path, FileMode::Write);
-    if (!open_file_result) {
-        LOG(ERROR) << "PrepareWriteBucket: failed to open file: "
-                   << prepared.bucket_data_path;
-        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
-    }
-    prepared.file = std::move(open_file_result.value());
-    prepared.fd = prepared.file->fd();
-
-    size_t total_size = static_cast<size_t>(prepared.metadata->data_size);
-    prepared.aligned_size = align_up(total_size, kDirectIOAlignment);
-
-    // Each prepared bucket owns its buffer until the batch I/O completes.
-    void* buf = nullptr;
-    int ret = posix_memalign(&buf, kDirectIOAlignment, prepared.aligned_size);
-    if (ret != 0) {
-        LOG(ERROR) << "PrepareWriteBucket: posix_memalign failed, bucket_id="
-                   << prepared.bucket_id << ", size=" << prepared.aligned_size
-                   << ": " << strerror(ret);
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    prepared.buffer = std::unique_ptr<void, void (*)(void*)>(
-        buf, [](void* p) { free(p); });
-
-    char* dst = static_cast<char*>(buf);
-    for (const auto& iov : iovs) {
-        memcpy(dst, iov.iov_base, iov.iov_len);
-        dst += iov.iov_len;
-    }
-    if (prepared.aligned_size > total_size) {
-        memset(dst, 0, prepared.aligned_size - total_size);
-    }
-
-    // Metadata is persisted only after data has been written and synced.
-    return prepared;
-}
-
-tl::expected<void, ErrorCode> BucketStorageBackend::FlushPreparedBuckets(
-    std::vector<PreparedBucket>& prepared) {
-    if (prepared.empty()) return {};
-
-    // FLAT_MEMORY: abort the batch without discarding metadata needed for NACK.
-    auto fail = [&](ErrorCode error) -> tl::expected<void, ErrorCode> {
-        for (auto& p : prepared) {
-            p.file.reset();
-            p.pending_.reset();
-        }
-        return tl::make_unexpected(error);
-    };
-    for (const auto& p : prepared) {
-        if (!p.pending_ || p.flushed_ || !p.file || !p.buffer) {
-            return fail(ErrorCode::INVALID_PARAMS);
-        }
-    }
-
-#ifdef USE_URING
-    if (file_storage_config_.use_uring) {
-        std::vector<UringFile::WriteDesc> descs;
-        descs.reserve(prepared.size());
-        size_t expected_total = 0;
-        for (auto& p : prepared) {
-            descs.push_back({p.fd, p.buffer.get(), p.aligned_size, /*off=*/0,
-                             KvIoObserverForFile(p.bucket_data_path),
-                             SsdKvIoDirection::Write});
-            expected_total += p.aligned_size;
-        }
-
-        auto result = UringFile::batch_write_multi_fd(
-            descs.data(), static_cast<int>(descs.size()));
-        if (!result) {
-            LOG(ERROR) << "FlushPreparedBuckets: batch_write_multi_fd failed";
-            return fail(result.error());
-        }
-        if (result.value() != expected_total) {
-            LOG(ERROR) << "FlushPreparedBuckets: size mismatch, expected="
-                       << expected_total << ", got=" << result.value();
-            return fail(ErrorCode::FILE_WRITE_FAIL);
-        }
-    } else
-#endif
-    {
-        // POSIX writes need the logical size, not the O_DIRECT padding.
-        for (auto& p : prepared) {
-            iovec iov{p.buffer.get(), static_cast<size_t>(p.metadata->data_size)};
-            auto result = p.file->vector_write(&iov, 1, 0);
-            if (!result) {
-                return fail(result.error());
-            }
-            if (result.value() != iov.iov_len) {
-                return fail(ErrorCode::FILE_WRITE_FAIL);
-            }
-        }
-    }
-
-    for (auto& p : prepared) {
-        auto sync_result = p.file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "FlushPreparedBuckets: datasync failed, bucket_id="
-                       << p.bucket_id;
-            return fail(sync_result.error());
-        }
-        auto meta_result = StoreBucketMetadata(p.bucket_id, p.metadata);
-        if (!meta_result) {
-            return fail(meta_result.error());
-        }
-        // FLAT_MEMORY: retain this event even if a later bucket/notify fails.
-        if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
-    }
-    {
-        MutexLocker cache_locker(&file_cache_mutex_);
-        for (auto& p : prepared) {
-            file_cache_.erase(p.bucket_data_path);
-            p.flushed_ = true;
-        }
-    }
-    return {};
-}
-
-// ---------------------------------------------------------------------------
-// MOONCAKE_SSD_OPT: PrepareBatchOffload — public entry for Phase 1
-// ---------------------------------------------------------------------------
-
-tl::expected<BucketStorageBackend::PreparedBucket, ErrorCode>
-BucketStorageBackend::PrepareBatchOffload(
-    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
-    EvictionHandler eviction_handler) {
-    if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "PrepareBatchOffload: backend not initialized";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    if (batch_object.empty()) {
-        return tl::make_unexpected(ErrorCode::INVALID_KEY);
-    }
-
-    auto enable_res = IsEnableOffloading();
-    if (!enable_res) {
-        return tl::make_unexpected(enable_res.error());
-    }
-    if (!enable_res.value()) {
-        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-    }
-
-    PreparedBucket prepared;
-    prepared.bucket_id = bucket_id_generator_->NextId();
-    std::vector<iovec> iovs;
-    auto build_res = BuildBucket(prepared.bucket_id, batch_object, iovs,
-                                 prepared.metadatas);
-    if (!build_res) {
-        LOG(ERROR) << "PrepareBatchOffload: BuildBucket failed, id="
-                   << prepared.bucket_id;
-        return tl::make_unexpected(build_res.error());
-    }
-    prepared.metadata = std::move(build_res.value());
-
-    // FLAT_MEMORY: use upstream reservations before opening/writing files.
-    auto pending = std::make_unique<PendingEviction>();
-    auto eviction_result = PrepareEviction(
-        prepared.metadata->data_size + prepared.metadata->meta_size,
-        prepared.metadata->keys);
-    if (!eviction_result) {
-        return tl::make_unexpected(eviction_result.error());
-    }
-    *pending = std::move(eviction_result.value());
-    if (eviction_handler && !pending->keys.empty()) {
-        auto notify_result = eviction_handler(pending->keys);
-        if (!notify_result) {
-            RestorePreparedEviction(std::move(*pending));
-            return tl::make_unexpected(notify_result.error());
-        }
-    }
-    CommitPreparedEviction(*pending);
-    prepared.pending_ = decltype(prepared.pending_)(
-        pending.release(),
-        PreparedBucket::Cleanup{this, prepared.bucket_id, false});
-
-    auto finalize_result = FinalizeEviction(*prepared.pending_);
-    if (!finalize_result) {
-        LOG(ERROR) << "FinalizeEviction failed after master committed eviction; "
-                      "continuing PrepareBatchOffload: "
-                   << finalize_result.error();
-    }
-    return PrepareWriteBucket(std::move(prepared), iovs);
-}
-
-// ---------------------------------------------------------------------------
-// MOONCAKE_SSD_OPT: CommitBucket — metadata commit for the three-phase path
-// ---------------------------------------------------------------------------
-
-tl::expected<int64_t, ErrorCode> BucketStorageBackend::CommitBucket(
-    PreparedBucket& prepared,
-    std::function<ErrorCode(const std::vector<std::string>& keys,
-                            std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
-    if (!prepared.pending_ || !prepared.flushed_) {
-        prepared.file.reset();
-        prepared.pending_.reset();
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    const auto bucket_id = prepared.bucket_id;
-    const auto& bucket_metadata = prepared.metadata;
-    const auto& keys = bucket_metadata->keys;
-    {
-        SharedMutexLocker lock(&mutex_);
-        ReleasePreparedWriteLocked(*prepared.pending_);
-        prepared.pending_->write_size = 0;
-
-        for (const auto& key : keys) {
-            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
-                LOG(WARNING) << "CommitBucket: duplicate key: " << key
-                             << ", bucket_id=" << bucket_id;
-                lock.unlock();
-                prepared.file.reset();
-                prepared.pending_.reset();
-                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-            }
-        }
-
-        total_size_ += bucket_metadata->data_size + bucket_metadata->meta_size;
-        object_bucket_map_.reserve(object_bucket_map_.size() + keys.size());
-        for (size_t i = 0; i < keys.size(); ++i) {
-            auto [it, inserted] =
-                object_bucket_map_.insert({keys[i], prepared.metadatas[i]});
-            CHECK(inserted) << "Reserved key became duplicated: " << keys[i];
-        }
-        auto ts = 0LL;
-        if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU) {
-            ts = std::chrono::steady_clock::now().time_since_epoch().count();
-            bucket_metadata->last_access_ns_.store(ts,
-                                                   std::memory_order_relaxed);
-        }
-        buckets_.emplace(bucket_id, bucket_metadata);
-        lru_index_.emplace(ts, bucket_id);
-        prepared.pending_.get_deleter().committed = true;
-    }
-
-    // FLAT_MEMORY: reads must find the local index before master notification.
-    if (complete_handler) {
-        auto error_code = complete_handler(keys, prepared.metadatas);
-        if (error_code != ErrorCode::OK) {
-            LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << keys.size()
-                       << ", Bucket id: " << bucket_id;
-            prepared.file.reset();
-            // The RAII deleter uses the upstream RollbackCommittedBucket,
-            // including waiting for bucket read guards before deleting files.
-            prepared.pending_.reset();
-            return tl::make_unexpected(error_code);
-        }
-    }
-    // Reservation was released under lock; disarm successful-write rollback.
-    delete prepared.pending_.release();
-    return bucket_id;
 }
 
 void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
@@ -4220,12 +3674,11 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
     }
 
 #ifdef USE_URING
-    // MOONCAKE_SSD_OPT: bucket data writes bypass Page Cache via O_DIRECT.
-    // FLAT_MEMORY: keep metadata writes buffered to avoid padding protobufs.
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
     const bool use_uring =
-        file_storage_config_.use_uring &&
-        (mode == FileMode::Read ||
-         std::filesystem::path(path).extension() == BUCKET_DATA_FILE_SUFFIX);
+        file_storage_config_.use_uring && mode == FileMode::Read;
     if (use_uring) {
         flags |= O_DIRECT;
     }

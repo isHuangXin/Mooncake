@@ -49,22 +49,13 @@ static GlobalBufInfo g_buf;
 // ============================================================================
 class SharedUringRing {
    public:
-    // P3: Increased from 32 → 500 for better NVMe queue utilization.
-    // NVMe SSDs have internal parallelism across NAND channels; higher QD
-    // allows more outstanding I/O commands, improving throughput.
-    static constexpr unsigned QUEUE_DEPTH = 500;
+    static constexpr unsigned QUEUE_DEPTH = 32;
     static constexpr size_t MIN_CHUNK = 4096;
     static_assert(
         QUEUE_DEPTH <= detail::SsdKvIoCompletionTracker::kCapacity / 2,
         "CQE attribution capacity must cover queued and in-flight SQEs");
 
     static SharedUringRing& instance() {
-        thread_local SharedUringRing tl_ring;
-        return tl_ring;
-    }
-
-    // FLAT_MEMORY: keep pending prefetch CQEs separate from synchronous I/O.
-    static SharedUringRing& prefetch_instance() {
         thread_local SharedUringRing tl_ring;
         return tl_ring;
     }
@@ -83,10 +74,6 @@ class SharedUringRing {
 
     // Register a buffer on THIS thread's ring.  Called lazily from each
     // thread before the first fixed-buffer I/O.
-    // Maximum size per iovec entry for io_uring_register_buffers.
-    // Kernel 5.15 pin_user_pages(FOLL_LONGTERM) fails for buffers > ~1 GB.
-    static constexpr size_t MAX_IOVEC_SIZE = 1024UL * 1024 * 1024;  // 1 GB
-
     bool ensure_buf_registered() {
         if (buf_registered_) return true;
         if (buf_register_failed_) return false;  // don't retry after failure
@@ -94,25 +81,14 @@ class SharedUringRing {
         void* b = g_buf.base.load(std::memory_order_acquire);
         size_t s = g_buf.size.load(std::memory_order_acquire);
         if (!b || !s) return false;
-
-        // Split the buffer into chunks of <= MAX_IOVEC_SIZE to work around
-        // kernel 5.15 pin_user_pages size limitation.
-        std::vector<struct iovec> iovs;
-        size_t offset = 0;
-        while (offset < s) {
-            size_t chunk = std::min(s - offset, MAX_IOVEC_SIZE);
-            iovs.push_back({static_cast<char*>(b) + offset, chunk});
-            offset += chunk;
-        }
-
-        int ret = io_uring_register_buffers(&ring_, iovs.data(),
-                                            static_cast<unsigned>(iovs.size()));
+        struct iovec iov{b, s};
+        int ret = io_uring_register_buffers(&ring_, &iov, 1);
         if (ret < 0) {
             int err = -ret;
             LOG(WARNING) << "[SharedUringRing] io_uring_register_buffers failed"
                          << " errno=" << err << " (" << strerror(err) << ")"
                          << " buf=" << b << " size=" << s
-                         << " chunks=" << iovs.size()
+                         << " pages=" << (s >> 12)
                          << " — falling back to non-fixed-buffer I/O";
             buf_register_failed_ = true;
             return false;
@@ -120,9 +96,8 @@ class SharedUringRing {
         buf_registered_ = true;
         buf_base_ = b;
         buf_size_ = s;
-        num_buf_chunks_ = iovs.size();
         LOG(INFO) << "[SharedUringRing] tid registered buffer addr=" << b
-                  << " size=" << s << " chunks=" << iovs.size();
+                  << " size=" << s;
         return true;
     }
 
@@ -208,8 +183,7 @@ class SharedUringRing {
                 }
                 auto& d = descs[idx + i];
                 if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off,
-                                             buf_index_for(d.buf));
+                    io_uring_prep_read_fixed(sqe, fd, d.buf, d.len, d.off, 0);
                 else
                     io_uring_prep_read(sqe, fd, d.buf, d.len, d.off);
                 sqe->user_data = op | static_cast<uint64_t>(i + 1);
@@ -223,197 +197,6 @@ class SharedUringRing {
             remaining -= batch;
         }
         return {};
-    }
-
-    // FLAT_MEMORY: Cross-fd batch read — each entry targets a different fd.
-    using ReadDescMultiFd = UringFile::ReadDescMultiFd;
-
-    tl::expected<size_t, ErrorCode> batch_read_multi_fd(
-        ReadDescMultiFd* descs, int cnt) {
-        if (!initialized_)
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        ensure_buf_registered();
-        for (int i = 0; i < cnt; ++i) {
-            descs[i].bytes_read = 0;
-            descs[i].error = ErrorCode::OK;
-            descs[i].completed = false;
-        }
-        size_t total = 0;
-        int remaining = cnt;
-        int idx = 0;
-
-        while (remaining > 0) {
-            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
-            if (io_uring_sq_space_left(&ring_) < static_cast<unsigned>(batch))
-                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-            uint64_t op = next_operation_tag();
-
-            for (int i = 0; i < batch; ++i) {
-                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-                if (!sqe) {
-                    LOG(ERROR)
-                        << "[SharedUringRing] SQ full (batch_read_multi_fd)";
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-                }
-                const auto& d = descs[idx + i];
-                if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                    io_uring_prep_read_fixed(sqe, d.fd, d.buf, d.len, d.off,
-                                             buf_index_for(d.buf));
-                else
-                    io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
-                sqe->user_data = op | static_cast<uint64_t>(i + 1);
-                io_completions_.Prepare(sqe->user_data, d.io_observer,
-                                        d.direction);
-            }
-
-            auto res = collect_batch(batch, op, descs + idx);
-            if (!res) return tl::make_unexpected(res.error());
-            for (int i = 0; i < batch; ++i)
-                total += descs[idx + i].bytes_read;
-            idx += batch;
-            remaining -= batch;
-        }
-        return total;
-    }
-
-    // =========================================================================
-    // P4: Async prefetch API — submit reads without waiting, collect later.
-    // =========================================================================
-
-    /// Submit reads without blocking. Returns the number of submitted SQEs.
-    /// Call collect_pending() later to wait for completions.
-    int submit_reads_async(const ReadDescMultiFd* descs, int cnt) {
-        if (!initialized_ || pending_cqes_ > 0) return 0;
-        ensure_buf_registered();
-        const int batch = std::min(cnt, static_cast<int>(QUEUE_DEPTH));
-        pending_reads_.assign(descs, descs + batch);
-        pending_op_ = next_operation_tag();
-        int submitted = 0;
-
-        for (int i = 0; i < batch; ++i) {
-            struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-            if (!sqe) break;
-
-            auto& d = pending_reads_[i];
-            d.bytes_read = 0;
-            d.error = ErrorCode::OK;
-            d.completed = false;
-            if (buf_registered_ && in_registered_buf(d.buf, d.len))
-                io_uring_prep_read_fixed(sqe, d.fd, d.buf, d.len, d.off,
-                                         buf_index_for(d.buf));
-            else
-                io_uring_prep_read(sqe, d.fd, d.buf, d.len, d.off);
-            sqe->user_data = pending_op_ | static_cast<uint64_t>(i + 1);
-            io_completions_.Prepare(sqe->user_data, d.io_observer, d.direction);
-            submitted++;
-        }
-
-        if (submitted > 0) {
-            // FLAT_MEMORY: reuse the upstream partial-submission handling,
-            // but do not wait for completions on the asynchronous path.
-            auto res = detail::submit_all_pending(
-                [this] { return io_uring_sq_ready(&ring_); },
-                [this](unsigned) { return io_uring_submit(&ring_); },
-                [] { std::this_thread::yield(); });
-            io_completions_.Submitted(res.submitted);
-            if (res.error != 0 || res.pending != 0 ||
-                res.submitted != static_cast<unsigned>(submitted)) {
-                io_completions_.SubmissionUncertain();
-                drain_submitted(res.submitted, pending_op_);
-                reset_ring();
-                pending_reads_.clear();
-                return 0;
-            }
-            pending_cqes_ = submitted;
-        }
-        return submitted;
-    }
-
-    /// Collect pending completions from previous async submits.
-    /// Returns total bytes read, or error.
-    tl::expected<size_t, ErrorCode> collect_pending() {
-        if (pending_cqes_ <= 0) return 0;
-        auto res = collect_batch(pending_cqes_, pending_op_,
-                                 pending_reads_.data(), true);
-        size_t total = 0;
-        for (int i = 0; i < pending_cqes_; ++i)
-            total += pending_reads_[i].bytes_read;
-        pending_cqes_ = 0;
-        pending_reads_.clear();
-        if (!res) return tl::make_unexpected(res.error());
-        return total;
-    }
-
-    /// Check how many pending completions are outstanding.
-    int pending_count() const { return pending_cqes_; }
-
-    // MOONCAKE_SSD_OPT: Descriptor for one independently-addressed write in a
-    // cross-fd batch.  Each entry targets a different file descriptor (different
-    // bucket file), enabling NVMe device queue depth > 1 from a single thread.
-    using WriteDesc = UringFile::WriteDesc;
-
-    /// Submit up to QUEUE_DEPTH independent writes at once (each to its own
-    /// fd), then collect completions.  Mirrors batch_read() but writes to
-    /// different file descriptors instead of different offsets within one fd.
-    tl::expected<size_t, ErrorCode> batch_write(const WriteDesc* descs, int cnt) {
-        if (!initialized_)
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        size_t total = 0;
-        int remaining = cnt;
-        int idx = 0;
-
-        while (remaining > 0) {
-            // FLAT_MEMORY: retain v0.3.13's large-I/O splitting and CQE tags.
-            if (descs[idx].len > max_rw_count()) {
-                const auto& d = descs[idx];
-                auto res = write(d.fd, d.buf, d.len, d.off, d.io_observer);
-                if (!res || res.value() != d.len)
-                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-                total += res.value();
-                ++idx;
-                --remaining;
-                continue;
-            }
-            int batch = 0;
-            while (batch < remaining && batch < static_cast<int>(QUEUE_DEPTH) &&
-                   descs[idx + batch].len <= max_rw_count()) {
-                ++batch;
-            }
-            if (io_uring_sq_space_left(&ring_) < static_cast<unsigned>(batch))
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            uint64_t op = next_operation_tag();
-            std::vector<ReadDesc> completions(batch);
-
-            for (int i = 0; i < batch; ++i) {
-                struct io_uring_sqe* sqe = io_uring_get_sqe(&ring_);
-                if (!sqe) {
-                    LOG(ERROR) << "[SharedUringRing] SQ full (batch_write)";
-                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-                }
-                const auto& d = descs[idx + i];
-                // FLAT_MEMORY: read-shaped result storage still represents a
-                // write. Preserve both source and direction explicitly.
-                completions[i].io_observer = d.io_observer;
-                completions[i].direction = d.direction;
-                io_uring_prep_write(sqe, d.fd, d.buf, d.len, d.off);
-                sqe->user_data = op | static_cast<uint64_t>(i + 1);
-                io_completions_.Prepare(sqe->user_data, d.io_observer,
-                                        d.direction);
-            }
-
-            auto res = collect_batch(batch, op, completions.data());
-            if (!res)
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-            for (int i = 0; i < batch; ++i) {
-                if (!completions[i].completed ||
-                    completions[i].bytes_read != descs[idx + i].len)
-                    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-                total += completions[i].bytes_read;
-            }
-            idx += batch;
-            remaining -= batch;
-        }
-        return total;
     }
 
     /// Issue IORING_FSYNC_DATASYNC.  Blocks until complete.
@@ -444,10 +227,7 @@ class SharedUringRing {
 
     SharedUringRing() { initialize_ring(); }
 
-    ~SharedUringRing() {
-        if (pending_cqes_ > 0) collect_pending();
-        shutdown_ring();
-    }
+    ~SharedUringRing() { shutdown_ring(); }
 
     // -----------------------------------------------------------------
     // Internal helpers
@@ -555,17 +335,7 @@ class SharedUringRing {
         if (!buf_registered_ || !buf_base_ || !buf_size_) return false;
         uintptr_t buf_addr = reinterpret_cast<uintptr_t>(buf);
         uintptr_t rb = reinterpret_cast<uintptr_t>(buf_base_);
-        // FLAT_MEMORY: fixed-buffer requests must stay within one 1GB iovec.
-        return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_) &&
-               len <= MAX_IOVEC_SIZE - (buf_addr - rb) % MAX_IOVEC_SIZE;
-    }
-
-    // Compute the buf_index for io_uring fixed-buffer ops when the buffer
-    // was registered as multiple iovec chunks of MAX_IOVEC_SIZE.
-    int buf_index_for(const void* buf) const {
-        uintptr_t addr = reinterpret_cast<uintptr_t>(buf);
-        uintptr_t base = reinterpret_cast<uintptr_t>(buf_base_);
-        return static_cast<int>((addr - base) / MAX_IOVEC_SIZE);
+        return buf_addr >= rb && (buf_addr + len) <= (rb + buf_size_);
     }
 
     static size_t next_pow2(size_t n) {
@@ -596,8 +366,7 @@ class SharedUringRing {
         return value;
     }
 
-    // FLAT_MEMORY: nine bits encode all 500 requests in a batch.
-    static constexpr unsigned BATCH_INDEX_BITS = 9;
+    static constexpr unsigned BATCH_INDEX_BITS = 8;
     static constexpr uint64_t BATCH_INDEX_MASK =
         (uint64_t{1} << BATCH_INDEX_BITS) - 1;
     static_assert(QUEUE_DEPTH <= BATCH_INDEX_MASK,
@@ -648,11 +417,9 @@ class SharedUringRing {
         return total;
     }
 
-    template <typename Desc>
     tl::expected<void, ErrorCode> collect_batch(int expected, uint64_t op_id,
-                                                Desc* descs,
-                                                bool already_submitted = false) {
-        if (!already_submitted && !prepare_completions(expected, op_id)) {
+                                                ReadDesc* descs) {
+        if (!prepare_completions(expected, op_id)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
@@ -728,14 +495,12 @@ class SharedUringRing {
 
                 if (is_write) {
                     if (fix_buf)
-                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur,
-                                                  buf_index_for(ptr));
+                        io_uring_prep_write_fixed(sqe, fd, ptr, chunk, cur, 0);
                     else
                         io_uring_prep_write(sqe, fd, ptr, chunk, cur);
                 } else {
                     if (fix_buf)
-                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur,
-                                                 buf_index_for(ptr));
+                        io_uring_prep_read_fixed(sqe, fd, ptr, chunk, cur, 0);
                     else
                         io_uring_prep_read(sqe, fd, ptr, chunk, cur);
                 }
@@ -838,12 +603,6 @@ class SharedUringRing {
     void* buf_base_ = nullptr;
     size_t buf_size_ = 0;
     uint64_t op_id_ = 0;  // monotonic ID for stale CQE filtering
-    size_t num_buf_chunks_ = 0;
-
-    // P4: Track pending CQEs for async prefetch API
-    int pending_cqes_ = 0;
-    uint64_t pending_op_ = 0;
-    std::vector<ReadDescMultiFd> pending_reads_;
 };
 
 // ============================================================================
@@ -1139,46 +898,6 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
-}
-
-// ---------------------------------------------------------------------------
-// MOONCAKE_SSD_OPT: batch_write_multi_fd — cross-fd batch write via io_uring
-// ---------------------------------------------------------------------------
-
-tl::expected<size_t, ErrorCode> UringFile::batch_write_multi_fd(
-    const WriteDesc* descs, int cnt) {
-    if (!descs || cnt <= 0)
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-
-    return SharedUringRing::instance().batch_write(descs, cnt);
-}
-
-// ---------------------------------------------------------------------------
-// FLAT_MEMORY: batch_read_multi_fd — cross-fd batch read via io_uring
-// ---------------------------------------------------------------------------
-
-tl::expected<size_t, ErrorCode> UringFile::batch_read_multi_fd(
-    ReadDescMultiFd* descs, int cnt) {
-    if (!descs || cnt <= 0)
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    return SharedUringRing::instance().batch_read_multi_fd(descs, cnt);
-}
-
-// ---------------------------------------------------------------------------
-// P4: Async prefetch API — submit reads without blocking, collect later
-// ---------------------------------------------------------------------------
-
-int UringFile::submit_reads_async(const ReadDescMultiFd* descs, int cnt) {
-    if (!descs || cnt <= 0) return 0;
-    return SharedUringRing::prefetch_instance().submit_reads_async(descs, cnt);
-}
-
-tl::expected<size_t, ErrorCode> UringFile::collect_pending_reads() {
-    return SharedUringRing::prefetch_instance().collect_pending();
-}
-
-int UringFile::pending_read_count() {
-    return SharedUringRing::prefetch_instance().pending_count();
 }
 
 // ---------------------------------------------------------------------------

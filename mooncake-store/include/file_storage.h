@@ -4,7 +4,6 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
-#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -232,18 +231,9 @@ class FileStorage {
     // parked on that lock passed the entry check before the drain latched.
     std::atomic<bool> draining_{false};
 
-    // MOONCAKE_SSD_OPT: Dedicated thread pool for parallel bucket offload.
-    // Replaces std::async to enable thread reuse and bounded concurrency.
-    std::unique_ptr<ThreadPool> offload_thread_pool_;
-
-    // FLAT_MEMORY: Cumulative counters for experiment-wide bandwidth tracking.
-    // These accumulate total bytes across all offload/read operations, and
-    // record the timestamp of the first I/O to compute experiment-wide
-    // effective throughput (口径③ for WRITE, 口径② for READ).
-    std::atomic<size_t> cumulative_write_bytes_{0};
+    // FLAT_MEMORY: cumulative read counters for experiment-wide bandwidth logs.
     std::atomic<size_t> cumulative_read_bytes_{0};
-    std::atomic<int64_t> first_write_ts_us_{0};  // epoch microseconds, 0 = unset
-    std::atomic<int64_t> first_read_ts_us_{0};   // epoch microseconds, 0 = unset
+    std::atomic<int64_t> first_read_ts_us_{0};  // epoch microseconds, 0 = unset
 
     // FLAT_MEMORY: Pointer to RealClient's IoStats for per-backend bandwidth
     // tracking. Shared ownership keeps stats alive until offload workers stop.

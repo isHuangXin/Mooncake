@@ -155,8 +155,7 @@ class StorageFile {
      */
     ErrorCode get_error_code() { return error_code_; }
 
-    // MOONCAKE_SSD_OPT: Expose the underlying file descriptor for
-    // cross-fd io_uring batch operations (batch_write).
+    // FLAT_MEMORY: raw descriptor for test wrappers.
     int fd() const { return fd_; }
 
    protected:
@@ -240,50 +239,6 @@ class UringFile : public StorageFile {
         SsdKvIoDirection direction = SsdKvIoDirection::Read;
     };
     tl::expected<void, ErrorCode> batch_read(ReadDesc *descs, int cnt);
-
-    // FLAT_MEMORY: Cross-fd batch read — submit up to QUEUE_DEPTH independent
-    // reads (each from a different fd) in one io_uring ring submission.
-    // Mirrors batch_write_multi_fd() but for reads.  Used by BatchLoad to
-    // submit reads across ALL bucket files in a single io_uring submission,
-    // maximising NVMe queue depth.
-    struct ReadDescMultiFd {
-        int fd;            ///< source file descriptor
-        void *buf;         ///< aligned destination buffer
-        size_t len;        ///< aligned read length
-        off_t off;         ///< file offset
-        // FLAT_MEMORY: preserve v0.3.13's per-request completion checks.
-        size_t bytes_read = 0;
-        ErrorCode error = ErrorCode::OK;
-        bool completed = false;
-        // FLAT_MEMORY: reads and read-shaped write completions stay distinct.
-        std::shared_ptr<SsdKvIoStats> io_observer;
-        SsdKvIoDirection direction = SsdKvIoDirection::Read;
-    };
-    static tl::expected<size_t, ErrorCode> batch_read_multi_fd(
-        ReadDescMultiFd *descs, int cnt);
-
-    // P4: Async prefetch API — submit reads without blocking, collect later.
-    // This enables pipelining: while processing current batch, submit next batch.
-    // FLAT_MEMORY: one outstanding batch per thread; keep fds and buffers alive
-    // until collect_pending_reads() on that same thread has returned.
-    static int submit_reads_async(const ReadDescMultiFd *descs, int cnt);
-    static tl::expected<size_t, ErrorCode> collect_pending_reads();
-    static int pending_read_count();
-
-    // MOONCAKE_SSD_OPT: Cross-fd batch write — submit up to QUEUE_DEPTH
-    // independent writes (each to a different fd) in one io_uring ring
-    // submission. Used by FlushPreparedBuckets() to saturate NVMe queue depth.
-    struct WriteDesc {
-        int fd;            ///< target file descriptor
-        const void *buf;   ///< aligned source buffer
-        size_t len;        ///< aligned write length
-        off_t off;         ///< file offset (typically 0)
-        // FLAT_MEMORY: optional owner source; ordinary files remain unobserved.
-        std::shared_ptr<SsdKvIoStats> io_observer;
-        SsdKvIoDirection direction = SsdKvIoDirection::Write;
-    };
-    static tl::expected<size_t, ErrorCode> batch_write_multi_fd(
-        const WriteDesc *descs, int cnt);
 
     // Flush data to stable storage via IORING_FSYNC_DATASYNC.
     // Must be called after write_aligned and before writing dependent metadata.

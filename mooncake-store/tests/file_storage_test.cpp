@@ -763,8 +763,8 @@ TEST_F(FileStorageTest, BatchLoad_WithStorageBackendAdaptor) {
     }
 }
 
-// FLAT_MEMORY: both dispatch modes publish the backend's completion source.
-TEST_F(FileStorageTest, IoDataSyncedMetricUsesBackendForSerialAndParallel) {
+// FLAT_MEMORY: bucket writes publish the backend's completion source.
+TEST_F(FileStorageTest, IoDataSyncedMetricUsesBackendCompletionSource) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     config.local_buffer_size = 1024 * 1024;
@@ -781,13 +781,9 @@ TEST_F(FileStorageTest, IoDataSyncedMetricUsesBackendForSerialAndParallel) {
     ASSERT_TRUE(backend->BatchOffload(objects, [](const auto&, auto&) {
         return ErrorCode::OK;
     }));
-    std::vector<BucketStorageBackend::PreparedBucket> prepared;
-    auto p = backend->PrepareBatchOffload(
-        {{"c", {{value.data(), value.size()}}}});
-    ASSERT_TRUE(p);
-    prepared.push_back(std::move(*p));
-    ASSERT_TRUE(backend->FlushPreparedBuckets(prepared));
-    ASSERT_TRUE(backend->CommitBucket(prepared[0], [](const auto&, auto&) {
+    std::unordered_map<std::string, std::vector<Slice>> more{
+        {"c", {{value.data(), value.size()}}}};
+    ASSERT_TRUE(backend->BatchOffload(more, [](const auto&, auto&) {
         return ErrorCode::OK;
     }));
     EXPECT_EQ(backend->GetDataSyncedStats()->buckets_completed(), 2);
