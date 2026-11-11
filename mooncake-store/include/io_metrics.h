@@ -135,7 +135,9 @@ class SsdKvIoStats {
     using Clock = std::chrono::steady_clock;
     using Now = std::function<Clock::time_point()>;
     static constexpr uint64_t kBucketWidthNs = 100000000;
-    static constexpr size_t kCapacity = 16384;
+    // FLAT_MEMORY: 131072 x 100 ms = 3.6 h, so a whole low-rate benchmark case
+    // stays in the window; about 3 MiB per snapshot copy.
+    static constexpr size_t kCapacity = 131072;
 
     struct Bucket {
         uint64_t id = 0;

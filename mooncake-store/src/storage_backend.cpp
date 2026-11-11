@@ -1711,12 +1711,13 @@ BucketStorageBackend::BucketStorageBackend(
     : StorageBackendInterface(file_storage_config_),
       data_synced_stats_(std::move(data_synced_stats)),
 #ifdef USE_URING
-      // This baseline uses io_uring for DATA reads, POSIX for DATA writes.
-      // Do not advertise write-CQE zero as a measured value.
+      // FLAT_MEMORY: DATA reads are io_uring CQEs; DATA writes are POSIX and
+      // are recorded by WriteBucket once datasync returns (durable bytes, the
+      // same point FlatCake's write peak uses).
       kv_io_stats_(file_storage_config_.use_uring
                        ? std::make_shared<SsdKvIoStats>(
                              [] { return SsdKvIoStats::Clock::now(); },
-                             std::array<bool, 2>{true, false})
+                             std::array<bool, 2>{true, true})
                        : nullptr),
 #else
       kv_io_stats_(nullptr),
@@ -2723,6 +2724,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
         }
         StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE,
                                            write_result.value(), 1);
+        // FLAT_MEMORY: write-mode DATA files are always PosixFile (OpenFile),
+        // so no io_uring observer saw these bytes; count them once, durable.
+        if (kv_io_stats_) {
+            kv_io_stats_->RecordCompleted(SsdKvIoDirection::Write,
+                                          write_result.value());
+        }
 
         // Invalidate cache for this file since content changed
         {

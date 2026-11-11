@@ -237,7 +237,7 @@ class BucketKvIoTestBackend : public BucketStorageBackend {
     using BucketStorageBackend::KvIoObserverForFile;
 };
 
-TEST(SsdKvIoCompletionTest, BackendCapabilityIsDataReadOnlyOnThisBaseline) {
+TEST(SsdKvIoCompletionTest, BackendObservesDataReadsAndDurableWrites) {
     FileStorageConfig config;
     config.use_uring = true;
     BucketKvIoTestBackend backend(config, BucketBackendConfig{});
@@ -245,8 +245,8 @@ TEST(SsdKvIoCompletionTest, BackendCapabilityIsDataReadOnlyOnThisBaseline) {
     ASSERT_TRUE(backend.GetKvIoStats());
     const auto source = backend.GetKvIoStats();
     EXPECT_TRUE(source->GetSnapshot().direction_available[0]);
-    // Existing bucket writes stay POSIX; do not claim measured zero CQE writes.
-    EXPECT_FALSE(source->GetSnapshot().direction_available[1]);
+    // Bucket DATA writes stay POSIX; WriteBucket records them after datasync.
+    EXPECT_TRUE(source->GetSnapshot().direction_available[1]);
     EXPECT_EQ(backend.KvIoObserverForFile("/unused/7.bucket"), source);
     EXPECT_FALSE(backend.KvIoObserverForFile("/unused/7.meta"));
     EXPECT_FALSE(backend.KvIoObserverForFile("/unused/7.bucket.meta"));
@@ -5379,6 +5379,12 @@ TEST_F(StorageBackendTest, BucketBatchLoadUsesUringAcrossQueueDepth) {
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+    // The POSIX DATA write must reach the write window, or the write peak
+    // reports unavailable for every Mooncake run.
+    const auto io = storage_backend.GetKvIoStats()->GetSnapshot();
+    EXPECT_TRUE(io.direction_available[1]);
+    EXPECT_GE(io.completed_bytes[1], kKeyCount * kValueSize);
+    EXPECT_EQ(io.completed_bytes[0], 0);
 
     using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
     std::vector<AlignedBuffer> read_buffers;

@@ -504,7 +504,7 @@ TEST(SsdKvIoMetricsTest, FrozenWireIsSparseExactAndIndependentOfDurableOps) {
             std::string::npos);
         for (const auto* line : {
                  "mooncake_ssd_kv_io_bucket_width_ns 100000000\n",
-                 "mooncake_ssd_kv_io_capacity_buckets 16384\n",
+                 "mooncake_ssd_kv_io_capacity_buckets 131072\n",
                  "mooncake_ssd_kv_io_snapshot_ns 200000003\n",
                  "mooncake_ssd_kv_io_oldest_bucket_id 0\n",
                  "mooncake_ssd_kv_io_newest_bucket_id 2\n",
