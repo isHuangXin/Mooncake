@@ -13,7 +13,7 @@ class PyClient;
 
 class GDSReader {
  public:
-    GDSReader(const std::string& root, int device, size_t max_io_bytes, int workers = 4);
+    GDSReader(const std::string& root, int device, size_t max_io_bytes, int workers = 16);
     ~GDSReader();
     std::vector<int> Read(const std::shared_ptr<PyClient>& store,
                           const std::vector<std::string>& keys,

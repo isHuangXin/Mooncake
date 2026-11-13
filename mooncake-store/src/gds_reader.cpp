@@ -3,8 +3,11 @@
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <filesystem>
+#include <functional>
 #include <mutex>
+#include <thread>
 #include <stdexcept>
 #include <unordered_map>
 #include <unordered_set>
@@ -53,13 +56,15 @@ bool SameFile(int fd, const LocalFileRead& range) {
            static_cast<uint64_t>(st.st_size) == range.file_size &&
            st.st_mtim.tv_sec == range.mtime_sec && st.st_mtim.tv_nsec == range.mtime_nsec;
 }
-// One concurrent reader: its own registered staging buffer, stream and cuFile
+// One worker thread: its own registered staging buffer, stream and cuFile
 // handles, which outlive a Read call (registering a handle costs milliseconds).
+// Only the worker's own thread touches them.
 struct Lane {
     void* scratch = nullptr;
     bool registered = false;
     cudaStream_t stream = nullptr;
     std::unordered_map<std::string, std::unique_ptr<FileHandle>> files;
+    std::thread thread;
 };
 // Bounds the descriptors a lane keeps; the cache is dropped whole when full.
 constexpr size_t kMaxOpenFiles = 256;
@@ -85,12 +90,26 @@ struct GDSReader::Impl {
     size_t max_io = 0;
     bool driver_open = false;
     std::vector<std::unique_ptr<Lane>> lanes;
-    std::vector<Lane*> idle;
-    std::mutex lane_mutex;
-    std::condition_variable lane_ready;
+    // FLAT_MEMORY: one queue shared by every worker (as FlatCake's GDS workers):
+    // an idle worker always takes the next object read of any Read call.
+    std::mutex queue_mutex;
+    std::condition_variable queue_ready;
+    std::deque<std::function<void(Lane&)>> queue;
+    bool stopping = false;
+    // Memory replicas (skip_memory == false) are copied on the calling thread.
+    std::mutex memory_mutex;
+    cudaStream_t memory_stream = nullptr;
 
     ~Impl() {
+        {
+            std::lock_guard lock(queue_mutex);
+            stopping = true;
+        }
+        queue_ready.notify_all();
+        for (auto& lane : lanes)
+            if (lane->thread.joinable()) lane->thread.join();
         cudaSetDevice(device);
+        if (memory_stream) cudaStreamDestroy(memory_stream);
         for (auto& lane : lanes) {
             if (lane->stream) cudaStreamSynchronize(lane->stream);
             lane->files.clear();
@@ -105,19 +124,26 @@ struct GDSReader::Impl {
         }
     }
 
-    Lane* Acquire() {
-        std::unique_lock lock(lane_mutex);
-        lane_ready.wait(lock, [this] { return !idle.empty(); });
-        Lane* lane = idle.back();
-        idle.pop_back();
-        return lane;
-    }
-    void Release(Lane* lane) {
+    void Submit(std::function<void(Lane&)> task) {
         {
-            std::lock_guard lock(lane_mutex);
-            idle.push_back(lane);
+            std::lock_guard lock(queue_mutex);
+            queue.push_back(std::move(task));
         }
-        lane_ready.notify_one();
+        queue_ready.notify_one();
+    }
+    void Serve(Lane& lane) {
+        cudaSetDevice(device);  // a failure surfaces as a failed read
+        for (;;) {
+            std::function<void(Lane&)> task;
+            {
+                std::unique_lock lock(queue_mutex);
+                queue_ready.wait(lock, [this] { return stopping || !queue.empty(); });
+                if (queue.empty()) return;  // stopping, and nothing left to drain
+                task = std::move(queue.front());
+                queue.pop_front();
+            }
+            task(lane);
+        }
     }
 
     FileHandle& Open(Lane& lane, const LocalFileRead& range) {
@@ -201,13 +227,14 @@ GDSReader::GDSReader(const std::string& root, int device, size_t max_io_bytes, i
         ++driver_users;
         p.driver_open = true;
     }
+    CheckCUDA(cudaStreamCreateWithFlags(&p.memory_stream, cudaStreamNonBlocking));
     for (int i = 0; i < workers; ++i) {
         auto& lane = *p.lanes.emplace_back(std::make_unique<Lane>());
         CheckCUDA(cudaStreamCreateWithFlags(&lane.stream, cudaStreamNonBlocking));
         CheckCUDA(cudaMalloc(&lane.scratch, max_io_bytes));
         CheckCuFile(cuFileBufRegister(lane.scratch, max_io_bytes, 0));
         lane.registered = true;
-        p.idle.push_back(&lane);
+        lane.thread = std::thread([&p, &lane] { p.Serve(lane); });
     }
     p.stats["gpu_staging_bytes"] = max_io_bytes * workers;
     p.stats["workers"] = workers;
@@ -266,12 +293,6 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             throw std::invalid_argument("GDS requires device buffers on its configured GPU");
     }
     std::vector<int> results(keys.size(), 0);
-    Lane* lane = p.Acquire();
-    struct LaneGuard {
-        Impl& p;
-        Lane* lane;
-        ~LaneGuard() { p.Release(lane); }
-    } lane_guard{p, lane};
     auto queries = store->client_->BatchQuery(keys);
     // FLAT_MEMORY: v0.3.13 offload RPCs address tenant-scoped storage keys.
     const TenantId tenant_id(store->client_->tenant_id());
@@ -312,16 +333,30 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
     }
     if (!memory_keys.empty()) {
         auto loaded = store->client_->BatchGet(memory_keys, memory_queries, slices);
+        std::lock_guard memory_lock(p.memory_mutex);
         for (size_t j = 0; j < loaded.size(); ++j) {
             size_t i = memory_indices[j];
             if (!loaded[j]) continue;
             CheckCUDA(cudaMemcpyAsync(reinterpret_cast<void*>(destinations[i]),
-                                  handles[j].ptr(), sizes[i], cudaMemcpyHostToDevice, lane->stream));
-            CheckCUDA(cudaStreamSynchronize(lane->stream));
+                                  handles[j].ptr(), sizes[i], cudaMemcpyHostToDevice, p.memory_stream));
+            CheckCUDA(cudaStreamSynchronize(p.memory_stream));
             p.Add("dram_payload_bytes", sizes[i]);
             results[i] = 1;
         }
     }
+    // Every SSD object of this call is one task on the shared workers; the call
+    // waits for all of them before it releases the owner's read leases.
+    struct Pending {
+        std::mutex mutex;
+        std::condition_variable done;
+        size_t left = 0;
+        void Wait() {
+            std::unique_lock lock(mutex);
+            done.wait(lock, [this] { return left == 0; });
+        }
+        ~Pending() { Wait(); }  // tasks reference this call's state
+    } pending;
+    std::vector<std::pair<std::string, uint64_t>> leases;
     for (const auto& [endpoint, indices] : disks) {
         std::vector<std::string> disk_keys;
         std::vector<int64_t> disk_sizes;
@@ -335,24 +370,41 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             LOG(ERROR) << "Cannot acquire GDS SSD read ranges: " << batch.error();
             continue;
         }
-        // Open FDs preserve immutable bucket data even if a read lease expires.
-        if (batch->files.size() == indices.size()) {
-            for (size_t j = 0; j < indices.size(); ++j) {
-                size_t i = indices[j];
+        leases.emplace_back(endpoint, batch->batch_id);
+        if (batch->files.size() != indices.size()) {
+            p.Add("read_errors", indices.size());
+            continue;
+        }
+        for (size_t j = 0; j < indices.size(); ++j) {
+            const size_t i = indices[j];
+            {
+                std::lock_guard lock(pending.mutex);
+                ++pending.left;
+            }
+            auto task = [&p, &pending, &results, &destinations, &sizes, i,
+                         range = batch->files[j]](Lane& lane) {
                 try {
-                    p.ReadFile(*lane, batch->files[j], destinations[i], sizes[i]);
+                    p.ReadFile(lane, range, destinations[i], sizes[i]);
                     results[i] = 2;
                 } catch (const std::exception& error) {
                     p.Add("read_errors", 1);
                     LOG(ERROR) << "GDS (compat) read failed: " << error.what();
                 }
+                std::lock_guard lock(pending.mutex);
+                if (--pending.left == 0) pending.done.notify_all();
+            };
+            try {
+                p.Submit(std::move(task));
+            } catch (...) {  // never queued: undo its count so the wait can end
+                std::lock_guard lock(pending.mutex);
+                --pending.left;
+                throw;
             }
-        } else {
-            p.Add("read_errors", indices.size());
         }
-        store->client_requester_->release_offload_buffer(endpoint, batch->batch_id);
     }
-    CheckCUDA(cudaStreamSynchronize(lane->stream));
+    pending.Wait();
+    for (const auto& [endpoint, batch_id] : leases)
+        store->client_requester_->release_offload_buffer(endpoint, batch_id);
     return results;
 #endif
 }
