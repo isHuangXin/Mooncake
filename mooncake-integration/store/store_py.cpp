@@ -2424,7 +2424,7 @@ PYBIND11_MODULE(store, m) {
             py::gil_scoped_release release;
             self.gds_reader_ = std::make_shared<GDSReader>(root, device, max_io_bytes, workers);
         }, py::arg("root"), py::arg("device"), py::arg("max_io_bytes") = 16777216,
-           py::arg("workers") = 4)
+           py::arg("workers") = 16)
         .def("batch_get_into_gpu", [](MooncakeStorePyWrapper &self,
             const std::vector<std::string> &keys,
             const std::vector<uintptr_t> &destinations, const std::vector<size_t> &sizes,
