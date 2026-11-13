@@ -133,7 +133,8 @@ class StorageIOMetric {
    public:
     using Clock = int64_t (*)();
     static constexpr int64_t kWindowNs = 100000000;
-    static constexpr uint64_t kMaxBuckets = 72000;
+    // FLAT_MEMORY: as the owner SSD ring (io_metrics.h kCapacity), 3.6 h of 100 ms buckets.
+    static constexpr uint64_t kMaxBuckets = 131072;
     static int64_t MonotonicNs();
     static StorageIOMetric& Instance();
 
