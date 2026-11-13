@@ -2007,6 +2007,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::CommitDirectBucket(
         CleanupOrphanedBucket(bucket_id);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    // FLAT_MEMORY: the rank fdatasync'ed the data before commit, so this bucket meets
+    // the data-synced definition (data synced, metadata written) as BatchOffload's do.
+    if (data_synced_stats_) data_synced_stats_->RecordBucketCompleted();
     {
         MutexLocker cache_locker(&file_cache_mutex_);
         file_cache_.erase(direct.data_path);
