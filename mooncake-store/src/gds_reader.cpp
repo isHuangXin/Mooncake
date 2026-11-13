@@ -77,7 +77,9 @@ struct GDSReader::Impl {
     std::map<std::string, uint64_t> stats{
         {"ssd_read_bytes", 0}, {"ssd_payload_bytes", 0}, {"ssd_read_ops", 0},
         {"ssd_read_ns", 0}, {"read_errors", 0}, {"dram_payload_bytes", 0},
-        {"gpu_staging_bytes", 0}, {"host_staging_peak_bytes", 0}};
+        {"gpu_staging_bytes", 0}, {"host_staging_peak_bytes", 0},
+        {"ssd_write_bytes", 0}, {"ssd_payload_write_bytes", 0}, {"ssd_write_ops", 0},
+        {"ssd_write_ns", 0}, {"write_errors", 0}, {"write_buckets", 0}};
     void Add(const std::string& key, uint64_t value) {
         std::lock_guard lock(stats_mutex);
         stats[key] += value;
@@ -99,6 +101,13 @@ struct GDSReader::Impl {
     // Memory replicas (skip_memory == false) are copied on the calling thread.
     std::mutex memory_mutex;
     cudaStream_t memory_stream = nullptr;
+    // GPU-direct writes: one staging buffer, one write at a time.
+    std::mutex write_mutex;
+    std::string owner_endpoint;
+    void* write_staging = nullptr;
+    size_t write_bytes = 0;
+    bool write_registered = false;
+    cudaStream_t write_stream = nullptr;
 
     ~Impl() {
         {
@@ -110,6 +119,10 @@ struct GDSReader::Impl {
             if (lane->thread.joinable()) lane->thread.join();
         cudaSetDevice(device);
         if (memory_stream) cudaStreamDestroy(memory_stream);
+        if (write_stream) cudaStreamSynchronize(write_stream);
+        if (write_registered) cuFileBufDeregister(write_staging);
+        if (write_staging) cudaFree(write_staging);
+        if (write_stream) cudaStreamDestroy(write_stream);
         for (auto& lane : lanes) {
             if (lane->stream) cudaStreamSynchronize(lane->stream);
             lane->files.clear();
@@ -168,6 +181,48 @@ struct GDSReader::Impl {
         descriptor.handle.fd = file->fd;
         CheckCuFile(cuFileHandleRegister(&file->handle, &descriptor));
         return *(lane.files[range.path] = std::move(file));
+    }
+
+    // Writes one reserved bucket file from GPU memory: [key][value] at each
+    // offset, zero-padded to 4 KiB, in one cuFileWrite, then fdatasync.
+    void WriteBucket(const LocalDirectBucket& bucket, const std::vector<std::string>& keys,
+                     const std::vector<uintptr_t>& sources, const std::vector<size_t>& sizes) {
+        auto relative = std::filesystem::path(bucket.path).lexically_relative(root);
+        if (relative.empty() || relative.is_absolute() || bucket.offsets.size() != keys.size())
+            throw std::runtime_error("Direct bucket is outside the configured root");
+        const size_t padded = (static_cast<size_t>(bucket.data_size) + 4095) & ~size_t(4095);
+        if (padded > write_bytes) throw std::runtime_error("Direct bucket exceeds GPU write staging");
+        char* staging = static_cast<char*>(write_staging);
+        for (size_t i = 0; i < keys.size(); ++i) {
+            char* at = staging + bucket.offsets[i];
+            CheckCUDA(cudaMemcpyAsync(at, keys[i].data(), keys[i].size(),
+                                      cudaMemcpyHostToDevice, write_stream));
+            CheckCUDA(cudaMemcpyAsync(at + keys[i].size(), reinterpret_cast<void*>(sources[i]),
+                                      sizes[i], cudaMemcpyDeviceToDevice, write_stream));
+        }
+        CheckCUDA(cudaMemsetAsync(staging + bucket.data_size, 0, padded - bucket.data_size,
+                                  write_stream));
+        CheckCUDA(cudaStreamSynchronize(write_stream));
+        struct open_how how {};
+        how.flags = O_WRONLY | O_DIRECT | O_CLOEXEC;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
+        FileHandle file;
+        file.fd = syscall(SYS_openat2, root_fd, relative.c_str(), &how, sizeof(how));
+        if (file.fd < 0) throw std::runtime_error("Cannot open direct bucket file");
+        CUfileDescr_t descriptor {};
+        descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
+        descriptor.handle.fd = file.fd;
+        CheckCuFile(cuFileHandleRegister(&file.handle, &descriptor));
+        auto start = std::chrono::steady_clock::now();
+        ssize_t written = cuFileWrite(file.handle, staging, padded, 0, 0);
+        const bool synced = written == static_cast<ssize_t>(padded) && ::fdatasync(file.fd) == 0;
+        auto finish = std::chrono::steady_clock::now();
+        Add("ssd_write_ns", std::chrono::duration_cast<std::chrono::nanoseconds>(finish - start).count());
+        Add("ssd_write_ops", 1);
+        if (written > 0) Add("ssd_write_bytes", written);
+        if (!synced) throw std::runtime_error("cuFile bucket write or fdatasync failed");
+        io_metric.Record(StorageIOKind::SSD_WRITE, padded, 1, 0,
+            std::chrono::duration_cast<std::chrono::nanoseconds>(finish.time_since_epoch()).count());
     }
 
     void ReadFile(Lane& lane, const LocalFileRead& range, uintptr_t destination, size_t size) {
@@ -242,6 +297,102 @@ GDSReader::GDSReader(const std::string& root, int device, size_t max_io_bytes, i
 }
 
 GDSReader::~GDSReader() = default;
+
+void GDSReader::EnableWrites(const std::string& owner_endpoint, size_t max_bucket_bytes) {
+#ifndef STORE_USE_GDS
+    throw std::runtime_error("GDS (compat) requires a STORE_USE_GDS build");
+#else
+    auto& p = *impl_;
+    std::lock_guard lock(p.write_mutex);
+    if (p.write_staging || owner_endpoint.empty() || max_bucket_bytes < 4096 ||
+        max_bucket_bytes % 4096 || max_bucket_bytes > (1ULL << 30))
+        throw std::invalid_argument("Invalid GDS writer configuration");
+    CheckCUDA(cudaSetDevice(p.device));
+    CheckCUDA(cudaStreamCreateWithFlags(&p.write_stream, cudaStreamNonBlocking));
+    CheckCUDA(cudaMalloc(&p.write_staging, max_bucket_bytes));
+    CheckCuFile(cuFileBufRegister(p.write_staging, max_bucket_bytes, 0));
+    p.write_registered = true;
+    p.write_bytes = max_bucket_bytes;
+    p.owner_endpoint = owner_endpoint;
+    std::lock_guard stats_lock(p.stats_mutex);
+    p.stats["gpu_write_staging_bytes"] = max_bucket_bytes;
+#endif
+}
+
+std::vector<int> GDSReader::Write(const std::shared_ptr<PyClient>& store,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& sources, const std::vector<size_t>& sizes) {
+#ifndef STORE_USE_GDS
+    throw std::runtime_error("GDS (compat) requires a STORE_USE_GDS build");
+#else
+    auto& p = *impl_;
+    if (!store || !store->client_ || !store->client_requester_ ||
+        keys.size() != sizes.size() || keys.size() != sources.size() || keys.size() > 4096 ||
+        std::unordered_set<std::string>(keys.begin(), keys.end()).size() != keys.size())
+        throw std::invalid_argument("Invalid GDS write batch (keys must be unique)");
+    std::lock_guard lock(p.write_mutex);
+    if (!p.write_staging) throw std::runtime_error("GDS writes are not enabled");
+    CheckCUDA(cudaSetDevice(p.device));
+    for (size_t i = 0; i < keys.size(); ++i) {
+        cudaPointerAttributes attrs {};
+        CheckCUDA(cudaPointerGetAttributes(&attrs, reinterpret_cast<void*>(sources[i])));
+        if (!sizes[i] || attrs.type != cudaMemoryTypeDevice || attrs.device != p.device)
+            throw std::invalid_argument("GDS writes need device buffers on its configured GPU");
+    }
+    const TenantId tenant_id(store->client_->tenant_id());
+    std::vector<int> results(keys.size(), 0);
+    size_t first = 0;
+    while (first < keys.size()) {
+        // A bucket holds as many whole objects as fit the write staging.
+        size_t last = first, bytes = 0;
+        while (last < keys.size() && bytes + keys[last].size() + sizes[last] + 4096 <= p.write_bytes) {
+            bytes += keys[last].size() + sizes[last];
+            ++last;
+        }
+        if (last == first) {
+            p.Add("write_errors", 1);
+            LOG(ERROR) << "GDS write: object exceeds the GPU write staging";
+            ++first;
+            continue;
+        }
+        std::vector<std::string> scoped;
+        std::vector<int64_t> scoped_sizes;
+        std::vector<uintptr_t> part_sources(sources.begin() + first, sources.begin() + last);
+        std::vector<size_t> part_sizes(sizes.begin() + first, sizes.begin() + last);
+        for (size_t i = first; i < last; ++i) {
+            scoped.push_back(tenant_id.MakeScopedKey(keys[i]));
+            scoped_sizes.push_back(static_cast<int64_t>(sizes[i]));
+        }
+        auto bucket = store->client_requester_->begin_direct_bucket(p.owner_endpoint, scoped, scoped_sizes);
+        if (!bucket) {
+            p.Add("write_errors", last - first);
+            LOG(ERROR) << "Cannot reserve a direct bucket: " << bucket.error();
+            first = last;
+            continue;
+        }
+        bool ok = false;
+        try {
+            p.WriteBucket(*bucket, scoped, part_sources, part_sizes);
+            auto committed = store->client_requester_->commit_direct_bucket(
+                p.owner_endpoint, bucket->bucket_id);
+            ok = committed.has_value();
+            if (!ok) LOG(ERROR) << "Cannot commit direct bucket: " << committed.error();
+        } catch (const std::exception& error) {
+            LOG(ERROR) << "GDS (compat) bucket write failed: " << error.what();
+            store->client_requester_->abort_direct_bucket(p.owner_endpoint, bucket->bucket_id);
+        }
+        if (ok) {
+            for (size_t i = first; i < last; ++i) results[i] = 1;
+            p.Add("write_buckets", 1);
+            p.Add("ssd_payload_write_bytes", bytes);
+        } else {
+            p.Add("write_errors", last - first);
+        }
+        first = last;
+    }
+    return results;
+#endif
+}
 
 std::map<std::string, uint64_t> GDSReader::Stats() const {
     std::lock_guard lock(impl_->stats_mutex);

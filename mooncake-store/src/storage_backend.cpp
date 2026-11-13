@@ -1896,6 +1896,167 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     return bucket_id;
 }
 
+// FLAT_MEMORY: GPU-direct bucket writes (Tutti baseline); see the header.
+tl::expected<BucketStorageBackend::DirectBucket, ErrorCode>
+BucketStorageBackend::BeginDirectBucket(const std::vector<std::string>& keys,
+                                        const std::vector<int64_t>& sizes,
+                                        EvictionHandler eviction_handler) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (keys.empty() || keys.size() != sizes.size()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
+    if (!enable_offloading_res.value()) {
+        return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
+    }
+    // Same layout as BuildBucket: [key][value] back to back, in key order.
+    auto bucket = std::make_shared<BucketMetadata>();
+    const int64_t bucket_id = bucket_id_generator_->NextId();
+    std::vector<StorageObjectMetadata> metadatas;
+    int64_t offset = 0;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        if (keys[i].empty() || sizes[i] <= 0) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto key_size = static_cast<int64_t>(keys[i].size());
+        bucket->metadatas.emplace_back(
+            BucketObjectMetadata{offset, key_size, sizes[i]});
+        metadatas.emplace_back(
+            StorageObjectMetadata{bucket_id, offset, key_size, sizes[i], ""});
+        bucket->keys.push_back(keys[i]);
+        offset += key_size + sizes[i];
+    }
+    bucket->data_size = offset;
+
+    // Evict old buckets to make room, as BatchOffload does.
+    auto prepare_result =
+        PrepareEviction(bucket->data_size + bucket->meta_size, bucket->keys);
+    if (!prepare_result) {
+        return tl::make_unexpected(prepare_result.error());
+    }
+    PendingEviction pending = std::move(prepare_result.value());
+    if (eviction_handler && !pending.keys.empty()) {
+        auto notify_result = eviction_handler(pending.keys);
+        if (!notify_result) {
+            RestorePreparedEviction(std::move(pending));
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+    CommitPreparedEviction(pending);
+    auto finalize_result = FinalizeEviction(pending);
+    if (!finalize_result) {
+        LOG(ERROR) << "FinalizeEviction failed for a direct bucket: "
+                   << finalize_result.error();
+    }
+
+    auto path = GetBucketDataPath(bucket_id);
+    int fd = path ? ::open(path->c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
+                           0644)
+                  : -1;
+    if (fd < 0) {
+        LOG(ERROR) << "Cannot create direct bucket data file, bucket_id="
+                   << bucket_id;
+        ReleasePreparedWrite(pending);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    ::close(fd);
+    DirectBucket result{bucket_id, path.value(), bucket->data_size, metadatas};
+    {
+        MutexLocker lock(&direct_mutex_);
+        direct_buckets_.emplace(
+            bucket_id, PendingDirectBucket{std::move(bucket), std::move(pending),
+                                           std::move(metadatas), path.value()});
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::CommitDirectBucket(
+    int64_t bucket_id, CompleteHandler complete_handler) {
+    PendingDirectBucket direct;
+    {
+        MutexLocker lock(&direct_mutex_);
+        auto it = direct_buckets_.find(bucket_id);
+        if (it == direct_buckets_.end()) {
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+        direct = std::move(it->second);
+        direct_buckets_.erase(it);
+    }
+    auto bucket = direct.bucket;
+    std::error_code ec;
+    const auto file_size = std::filesystem::file_size(direct.data_path, ec);
+    if (ec || static_cast<int64_t>(file_size) < bucket->data_size) {
+        LOG(ERROR) << "Direct bucket " << bucket_id << " data file is short: "
+                   << (ec ? ec.message() : std::to_string(file_size));
+        ReleasePreparedWrite(direct.pending);
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    StorageIOMetric::Instance().Record(StorageIOKind::SSD_WRITE, file_size, 1);
+    if (kv_io_stats_) {
+        kv_io_stats_->RecordCompleted(SsdKvIoDirection::Write, file_size);
+    }
+    auto store_result = StoreBucketMetadata(bucket_id, bucket);
+    if (!store_result) {
+        ReleasePreparedWrite(direct.pending);
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(direct.data_path);
+    }
+    const auto bucket_keys = bucket->keys;
+    {
+        SharedMutexLocker lock(&mutex_);
+        ReleasePreparedWriteLocked(direct.pending);
+        for (const auto& key : bucket_keys) {
+            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+                lock.unlock();
+                CleanupOrphanedBucket(bucket_id);
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
+        total_size_ += bucket->data_size + bucket->meta_size;
+        for (size_t i = 0; i < bucket_keys.size(); ++i) {
+            object_bucket_map_.insert({bucket_keys[i], direct.metadatas[i]});
+        }
+        auto ts = 0LL;
+        if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::LRU) {
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
+            bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+        }
+        buckets_.emplace(bucket_id, std::move(bucket));
+        lru_index_.emplace(ts, bucket_id);
+    }
+    if (complete_handler != nullptr) {
+        auto error_code = complete_handler(bucket_keys, direct.metadatas);
+        if (error_code != ErrorCode::OK) {
+            RollbackCommittedBucket(bucket_id, bucket_keys);
+            return tl::make_unexpected(error_code);
+        }
+    }
+    return {};
+}
+
+void BucketStorageBackend::AbortDirectBucket(int64_t bucket_id) {
+    PendingDirectBucket direct;
+    {
+        MutexLocker lock(&direct_mutex_);
+        auto it = direct_buckets_.find(bucket_id);
+        if (it == direct_buckets_.end()) return;
+        direct = std::move(it->second);
+        direct_buckets_.erase(it);
+    }
+    ReleasePreparedWrite(direct.pending);
+    CleanupOrphanedBucket(bucket_id);
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     const std::vector<std::string>& keys,
     std::unordered_map<std::string, StorageObjectMetadata>&

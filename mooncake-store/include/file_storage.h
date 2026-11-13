@@ -83,6 +83,13 @@ class FileStorage {
         return pinned_restore_arena_allocator_ != nullptr;
     }
 
+    // FLAT_MEMORY: GPU-direct bucket writes (Tutti baseline); keys are
+    // tenant-scoped storage keys, as in AcquireLocalReads.
+    tl::expected<LocalDirectBucket, ErrorCode> BeginDirectBucket(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes);
+    tl::expected<void, ErrorCode> CommitDirectBucket(int64_t bucket_id);
+    void AbortDirectBucket(int64_t bucket_id);
+
     tl::expected<LocalFileReadBatch, ErrorCode> AcquireLocalReads(
         const std::vector<std::string>& keys, const std::vector<int64_t>& sizes);
 

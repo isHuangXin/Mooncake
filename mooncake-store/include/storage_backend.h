@@ -1041,6 +1041,26 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    // FLAT_MEMORY: GPU-direct bucket writes (Tutti baseline). Begin reserves a
+    // bucket and creates its empty data file; a client then writes the whole
+    // file itself ([key][value]... zero-padded to 4 KiB, as WriteBucket does)
+    // and Commit stores the metadata, indexes the keys and runs the handler.
+    struct DirectBucket {
+        int64_t bucket_id = 0;
+        std::string data_path;
+        int64_t data_size = 0;  // unpadded bytes
+        std::vector<StorageObjectMetadata> metadatas;
+    };
+    using CompleteHandler = std::function<ErrorCode(
+        const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas)>;
+    tl::expected<DirectBucket, ErrorCode> BeginDirectBucket(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes, EvictionHandler eviction_handler);
+    tl::expected<void, ErrorCode> CommitDirectBucket(
+        int64_t bucket_id, CompleteHandler complete_handler);
+    void AbortDirectBucket(int64_t bucket_id);
+
    private:
     const std::shared_ptr<SsdDataSyncedStats> data_synced_stats_;
     const std::shared_ptr<SsdKvIoStats> kv_io_stats_;
@@ -1121,6 +1141,15 @@ class BucketStorageBackend : public StorageBackendInterface {
         int64_t evicted_size = 0;
         int64_t write_size = 0;
     };
+    struct PendingDirectBucket {
+        std::shared_ptr<BucketMetadata> bucket;
+        PendingEviction pending;
+        std::vector<StorageObjectMetadata> metadatas;
+        std::string data_path;
+    };
+    mutable Mutex direct_mutex_;
+    std::unordered_map<int64_t, PendingDirectBucket> GUARDED_BY(direct_mutex_)
+        direct_buckets_;
 
     /**
      * @brief Phase 1 of eviction: under exclusive lock, select and remove

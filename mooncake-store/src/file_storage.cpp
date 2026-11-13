@@ -163,6 +163,46 @@ tl::expected<LocalFileReadBatch, ErrorCode> FileStorage::AcquireLocalReads(
     return LocalFileReadBatch{batch->batch_id, std::move(*files)};
 }
 
+tl::expected<LocalDirectBucket, ErrorCode> FileStorage::BeginDirectBucket(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket || !Environ::GetBool("MOONCAKE_ALLOW_LOCAL_GDS", false)) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto direct = bucket->BeginDirectBucket(
+        keys, sizes, [this](const std::vector<std::string>& evicted_keys) {
+            return NotifyEvictedDiskReplicas(evicted_keys);
+        });
+    if (!direct) return tl::make_unexpected(direct.error());
+    LocalDirectBucket result{direct->bucket_id, direct->data_path,
+                             direct->data_size, {}};
+    for (const auto& metadata : direct->metadatas) {
+        result.offsets.push_back(metadata.offset);
+    }
+    return result;
+}
+
+tl::expected<void, ErrorCode> FileStorage::CommitDirectBucket(int64_t bucket_id) {
+    auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (!bucket) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    // Registers disk-only objects with the master, as a rescan does.
+    return bucket->CommitDirectBucket(
+        bucket_id, [this](const std::vector<std::string>& keys,
+                          std::vector<StorageObjectMetadata>& metadatas) {
+            for (auto& metadata : metadatas) {
+                metadata.transport_endpoint = local_rpc_addr_;
+            }
+            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+            auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+            return result ? ErrorCode::OK : result.error();
+        });
+}
+
+void FileStorage::AbortDirectBucket(int64_t bucket_id) {
+    auto bucket = std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_);
+    if (bucket) bucket->AbortDirectBucket(bucket_id);
+}
+
 bool FileStorage::SupportsNativeIOMetrics() const {
 #ifdef USE_URING
     return config_.use_uring &&

@@ -20,6 +20,14 @@ class GDSReader {
                           const std::vector<uintptr_t>& destinations,
                           const std::vector<size_t>& sizes,
                           bool skip_memory = false);
+    // FLAT_MEMORY: GPU-direct writes (Tutti baseline). Each call writes the
+    // objects as owner buckets of at most max_bucket_bytes through
+    // cuFileWrite; returns 1 per object written, 0 otherwise.
+    void EnableWrites(const std::string& owner_endpoint, size_t max_bucket_bytes);
+    std::vector<int> Write(const std::shared_ptr<PyClient>& store,
+                           const std::vector<std::string>& keys,
+                           const std::vector<uintptr_t>& sources,
+                           const std::vector<size_t>& sizes);
     std::map<std::string, uint64_t> Stats() const;
     bool BeginIOWindow(uint64_t window_id, int64_t start_ns);
     bool EndIOWindow(uint64_t window_id, int64_t end_ns, bool abort = false);

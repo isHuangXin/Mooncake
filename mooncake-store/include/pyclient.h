@@ -146,6 +146,13 @@ class ClientRequester {
     // Deterministic owner RPC/release substitutes in CPU-only tests.
     virtual ~ClientRequester() = default;
 
+    tl::expected<LocalDirectBucket, ErrorCode> begin_direct_bucket(
+        const std::string &client_addr, const std::vector<std::string> &keys,
+        const std::vector<int64_t> &sizes);
+    tl::expected<bool, ErrorCode> commit_direct_bucket(
+        const std::string &client_addr, int64_t bucket_id);
+    void abort_direct_bucket(const std::string &client_addr, int64_t bucket_id);
+
     tl::expected<LocalFileReadBatch, ErrorCode> acquire_local_reads(
         const std::string &client_addr, const std::vector<std::string> &keys,
         const std::vector<int64_t> &sizes);

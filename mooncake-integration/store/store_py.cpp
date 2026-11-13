@@ -2436,6 +2436,23 @@ PYBIND11_MODULE(store, m) {
             return reader->Read(store, keys, destinations, sizes, skip_memory);
         }, py::arg("keys"), py::arg("destinations"), py::arg("sizes"),
            py::arg("skip_memory") = false)
+        // FLAT_MEMORY: GPU-direct writes into the SSD owner (Tutti baseline).
+        .def("enable_gds_writes", [](MooncakeStorePyWrapper &self, const std::string &owner_endpoint,
+                                     size_t max_bucket_bytes) {
+            auto reader = self.gds_reader_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            reader->EnableWrites(owner_endpoint, max_bucket_bytes);
+        }, py::arg("owner_endpoint"), py::arg("max_bucket_bytes") = 67108864)
+        .def("batch_put_from_gpu", [](MooncakeStorePyWrapper &self,
+            const std::vector<std::string> &keys,
+            const std::vector<uintptr_t> &sources, const std::vector<size_t> &sizes) {
+            auto reader = self.gds_reader_;
+            auto store = self.store_;
+            if (!reader) throw std::runtime_error("GDS reader is not enabled");
+            py::gil_scoped_release release;
+            return reader->Write(store, keys, sources, sizes);
+        }, py::arg("keys"), py::arg("sources"), py::arg("sizes"))
         .def("begin_gds_io_window", [](MooncakeStorePyWrapper &self, uint64_t id, int64_t start_ns) {
             auto reader = self.gds_reader_;
             if (!reader) throw std::runtime_error("GDS reader is not enabled");

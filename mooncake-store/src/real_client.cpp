@@ -1146,8 +1146,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
         // Use port 0 to let the OS auto-allocate an available port.
-        offload_rpc_server_ =
-            std::make_unique<coro_rpc::coro_rpc_server>(1, 0, "0.0.0.0");
+        // FLAT_MEMORY: MOONCAKE_OFFLOAD_RPC_PORT pins it, so GPU-direct
+        // writers (Tutti baseline) can reach the owner before any replica
+        // advertises its endpoint.
+        const auto offload_port = static_cast<uint16_t>(
+            Environ::GetInt64("MOONCAKE_OFFLOAD_RPC_PORT", 0));
+        offload_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
+            1, offload_port, "0.0.0.0");
         offload_rpc_server_
             ->register_handler<&RealClient::batch_get_offload_object>(this);
         offload_rpc_server_
@@ -1155,6 +1160,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         // FLAT_MEMORY: expose guarded GDS ranges on the embedded owner RPC.
         offload_rpc_server_
             ->register_handler<&RealClient::acquire_local_reads>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::begin_direct_bucket>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::commit_direct_bucket>(this);
+        offload_rpc_server_
+            ->register_handler<&RealClient::abort_direct_bucket>(this);
         offload_rpc_server_->async_start();
         auto err = offload_rpc_server_->get_errc();
         if (err) {
@@ -6923,6 +6934,48 @@ tl::expected<LocalFileReadBatch, ErrorCode> RealClient::acquire_local_reads(
     const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
     if (!file_storage_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     return file_storage_->AcquireLocalReads(keys, sizes);
+}
+
+tl::expected<LocalDirectBucket, ErrorCode> RealClient::begin_direct_bucket(
+    const std::vector<std::string> &keys, const std::vector<int64_t> &sizes) {
+    if (!file_storage_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    return file_storage_->BeginDirectBucket(keys, sizes);
+}
+
+tl::expected<bool, ErrorCode> RealClient::commit_direct_bucket(int64_t bucket_id) {
+    if (!file_storage_) return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    auto result = file_storage_->CommitDirectBucket(bucket_id);
+    if (!result) return tl::make_unexpected(result.error());
+    return true;
+}
+
+bool RealClient::abort_direct_bucket(int64_t bucket_id) {
+    if (!file_storage_) return false;
+    file_storage_->AbortDirectBucket(bucket_id);
+    return true;
+}
+
+tl::expected<LocalDirectBucket, ErrorCode> ClientRequester::begin_direct_bucket(
+    const std::string &client_addr, const std::vector<std::string> &keys,
+    const std::vector<int64_t> &sizes) {
+    return invoke_rpc<&RealClient::begin_direct_bucket, LocalDirectBucket>(
+        client_addr, keys, sizes);
+}
+
+tl::expected<bool, ErrorCode> ClientRequester::commit_direct_bucket(
+    const std::string &client_addr, int64_t bucket_id) {
+    return invoke_rpc<&RealClient::commit_direct_bucket, bool>(client_addr,
+                                                               bucket_id);
+}
+
+void ClientRequester::abort_direct_bucket(const std::string &client_addr,
+                                          int64_t bucket_id) {
+    auto result = invoke_rpc<&RealClient::abort_direct_bucket, bool>(
+        client_addr, bucket_id);
+    if (!result) {
+        LOG(WARNING) << "abort_direct_bucket failed for bucket " << bucket_id
+                     << " at " << client_addr << ": " << result.error();
+    }
 }
 
 tl::expected<LocalFileReadBatch, ErrorCode> ClientRequester::acquire_local_reads(

@@ -776,6 +776,12 @@ class RealClient : public PyClient {
      */
     bool release_offload_buffer(uint64_t batch_id);
 
+    // FLAT_MEMORY: GPU-direct bucket writes (Tutti baseline), owner side.
+    tl::expected<LocalDirectBucket, ErrorCode> begin_direct_bucket(
+        const std::vector<std::string> &keys, const std::vector<int64_t> &sizes);
+    tl::expected<bool, ErrorCode> commit_direct_bucket(int64_t bucket_id);
+    bool abort_direct_bucket(int64_t bucket_id);
+
     tl::expected<LocalFileReadBatch, ErrorCode> acquire_local_reads(
         const std::vector<std::string> &keys, const std::vector<int64_t> &sizes);
 

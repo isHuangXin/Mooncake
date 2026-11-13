@@ -530,6 +530,17 @@ struct LocalFileReadBatch {
     YLT_REFL(LocalFileReadBatch, batch_id, files);
 };
 
+// FLAT_MEMORY: a bucket reserved for a GPU-direct write (Tutti baseline). The
+// client writes the data file at `path`: [key][value] at each object's offset,
+// zero-padded to 4 KiB, then asks the owner to commit `bucket_id`.
+struct LocalDirectBucket {
+    int64_t bucket_id = 0;
+    std::string path;
+    int64_t data_size = 0;
+    std::vector<int64_t> offsets;
+    YLT_REFL(LocalDirectBucket, bucket_id, path, data_size, offsets);
+};
+
 struct StorageObjectMetadata {
     int64_t bucket_id;
     int64_t offset;
