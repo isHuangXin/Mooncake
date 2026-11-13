@@ -16,6 +16,7 @@
 #include <glog/logging.h>
 #include <liburing.h>
 
+#include "environ.h"
 #include "file_interface.h"
 #include "uring_submit.h"
 #include "client_metric.h"
@@ -52,6 +53,22 @@ class SharedUringRing {
    public:
     static constexpr unsigned QUEUE_DEPTH = 32;
     static constexpr size_t MIN_CHUNK = 4096;
+
+    // FLAT_MEMORY: reads in flight per ring (per thread) at most; writes keep
+    // QUEUE_DEPTH. MOONCAKE_OFFLOAD_URING_READ_DEPTH (1..QUEUE_DEPTH, default
+    // QUEUE_DEPTH) lets an experiment cap SSD read concurrency.
+    static unsigned read_depth() {
+        static const unsigned depth = [] {
+            const int64_t value = Environ::GetInt64(
+                "MOONCAKE_OFFLOAD_URING_READ_DEPTH", QUEUE_DEPTH);
+            return static_cast<unsigned>(
+                std::clamp<int64_t>(value, 1, QUEUE_DEPTH));
+        }();
+        return depth;
+    }
+    static unsigned depth(bool is_write) {
+        return is_write ? QUEUE_DEPTH : read_depth();
+    }
 
     static SharedUringRing& instance() {
         thread_local SharedUringRing tl_ring;
@@ -169,7 +186,7 @@ class SharedUringRing {
         int idx = 0;
 
         while (remaining > 0) {
-            int batch = std::min(remaining, static_cast<int>(QUEUE_DEPTH));
+            int batch = std::min(remaining, static_cast<int>(read_depth()));
             if (io_uring_sq_space_left(&ring_) < static_cast<unsigned>(batch)) {
                 LOG(ERROR) << "[SharedUringRing] insufficient SQ space for "
                            << batch << " batch reads";
@@ -497,9 +514,9 @@ class SharedUringRing {
         off_t cur = off;
 
         while (remaining > 0) {
-            size_t cs = calc_chunk(remaining, QUEUE_DEPTH);
+            size_t cs = calc_chunk(remaining, depth(is_write));
             unsigned n = std::min(
-                static_cast<unsigned>((remaining + cs - 1) / cs), QUEUE_DEPTH);
+                static_cast<unsigned>((remaining + cs - 1) / cs), depth(is_write));
 
             for (unsigned i = 0; i < n; ++i) {
                 size_t chunk = std::min({cs, remaining, max_rw_count()});
@@ -573,7 +590,7 @@ class SharedUringRing {
             }
 
             int batch = 0;
-            while (batch < remaining && batch < static_cast<int>(QUEUE_DEPTH) &&
+            while (batch < remaining && batch < static_cast<int>(depth(is_write)) &&
                    iovs[idx + batch].iov_len <= max_io) {
                 ++batch;
             }
