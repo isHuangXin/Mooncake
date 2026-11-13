@@ -2418,21 +2418,24 @@ PYBIND11_MODULE(store, m) {
              })
         .def("get_storage_io_stats", &MooncakeStorePyWrapper::get_storage_io_stats)
         .def("enable_gds", [](MooncakeStorePyWrapper &self, const std::string &root,
-                              int device, size_t max_io_bytes) {
+                              int device, size_t max_io_bytes, int workers) {
             if (!self.is_client_initialized() || self.use_dummy_client_ || self.gds_reader_)
                 throw std::runtime_error("GDS requires an initialized RealClient without an active reader");
             py::gil_scoped_release release;
-            self.gds_reader_ = std::make_shared<GDSReader>(root, device, max_io_bytes);
-        }, py::arg("root"), py::arg("device"), py::arg("max_io_bytes") = 16777216)
+            self.gds_reader_ = std::make_shared<GDSReader>(root, device, max_io_bytes, workers);
+        }, py::arg("root"), py::arg("device"), py::arg("max_io_bytes") = 16777216,
+           py::arg("workers") = 4)
         .def("batch_get_into_gpu", [](MooncakeStorePyWrapper &self,
             const std::vector<std::string> &keys,
-            const std::vector<uintptr_t> &destinations, const std::vector<size_t> &sizes) {
+            const std::vector<uintptr_t> &destinations, const std::vector<size_t> &sizes,
+            bool skip_memory) {
             auto reader = self.gds_reader_;
             auto store = self.store_;
             if (!reader) throw std::runtime_error("GDS reader is not enabled");
             py::gil_scoped_release release;
-            return reader->Read(store, keys, destinations, sizes);
-        }, py::arg("keys"), py::arg("destinations"), py::arg("sizes"))
+            return reader->Read(store, keys, destinations, sizes, skip_memory);
+        }, py::arg("keys"), py::arg("destinations"), py::arg("sizes"),
+           py::arg("skip_memory") = false)
         .def("begin_gds_io_window", [](MooncakeStorePyWrapper &self, uint64_t id, int64_t start_ns) {
             auto reader = self.gds_reader_;
             if (!reader) throw std::runtime_error("GDS reader is not enabled");

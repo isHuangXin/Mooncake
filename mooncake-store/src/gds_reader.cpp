@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <mutex>
 #include <stdexcept>
@@ -44,11 +45,28 @@ struct FileHandle {
         if (fd >= 0) ::close(fd);
     }
 };
+bool SameFile(int fd, const LocalFileRead& range) {
+    struct stat st {};
+    return !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+           static_cast<uint64_t>(st.st_dev) == range.device &&
+           static_cast<uint64_t>(st.st_ino) == range.inode &&
+           static_cast<uint64_t>(st.st_size) == range.file_size &&
+           st.st_mtim.tv_sec == range.mtime_sec && st.st_mtim.tv_nsec == range.mtime_nsec;
+}
+// One concurrent reader: its own registered staging buffer, stream and cuFile
+// handles, which outlive a Read call (registering a handle costs milliseconds).
+struct Lane {
+    void* scratch = nullptr;
+    bool registered = false;
+    cudaStream_t stream = nullptr;
+    std::unordered_map<std::string, std::unique_ptr<FileHandle>> files;
+};
+// Bounds the descriptors a lane keeps; the cache is dropped whole when full.
+constexpr size_t kMaxOpenFiles = 256;
 }
 #endif
 
 struct GDSReader::Impl {
-    mutable std::mutex mutex;
     mutable std::mutex stats_mutex;
     StorageIOMetric io_metric{true};
     std::map<std::string, uint64_t> stats{
@@ -65,19 +83,21 @@ struct GDSReader::Impl {
     int root_fd = -1;
     int device = 0;
     size_t max_io = 0;
-    void* scratch = nullptr;
-    bool registered = false;
     bool driver_open = false;
-    cudaStream_t stream = nullptr;
+    std::vector<std::unique_ptr<Lane>> lanes;
+    std::vector<Lane*> idle;
+    std::mutex lane_mutex;
+    std::condition_variable lane_ready;
 
     ~Impl() {
-        if (scratch) {
-            cudaSetDevice(device);
-            if (stream) cudaStreamSynchronize(stream);
-            if (registered) cuFileBufDeregister(scratch);
-            cudaFree(scratch);
+        cudaSetDevice(device);
+        for (auto& lane : lanes) {
+            if (lane->stream) cudaStreamSynchronize(lane->stream);
+            lane->files.clear();
+            if (lane->registered) cuFileBufDeregister(lane->scratch);
+            if (lane->scratch) cudaFree(lane->scratch);
+            if (lane->stream) cudaStreamDestroy(lane->stream);
         }
-        if (stream) cudaStreamDestroy(stream);
         if (root_fd >= 0) ::close(root_fd);
         if (driver_open) {
             std::lock_guard lock(driver_mutex);
@@ -85,35 +105,50 @@ struct GDSReader::Impl {
         }
     }
 
-    void ReadFile(const LocalFileRead& range, uintptr_t destination, size_t size,
-                  std::unordered_map<std::string, std::unique_ptr<FileHandle>>& files) {
-        if (range.path.empty() || range.size != size || !size ||
-            range.offset > range.file_size || size > range.file_size - range.offset)
-            throw std::runtime_error("Invalid or missing local SSD range");
+    Lane* Acquire() {
+        std::unique_lock lock(lane_mutex);
+        lane_ready.wait(lock, [this] { return !idle.empty(); });
+        Lane* lane = idle.back();
+        idle.pop_back();
+        return lane;
+    }
+    void Release(Lane* lane) {
+        {
+            std::lock_guard lock(lane_mutex);
+            idle.push_back(lane);
+        }
+        lane_ready.notify_one();
+    }
+
+    FileHandle& Open(Lane& lane, const LocalFileRead& range) {
         auto relative = std::filesystem::path(range.path).lexically_relative(root);
         if (relative.empty() || relative.is_absolute())
             throw std::runtime_error("SSD file is outside the configured root");
-        auto& cached = files[range.path];
-        if (!cached) cached = std::make_unique<FileHandle>();
-        auto& file = *cached;
-        if (file.fd < 0) {
-            struct open_how how {};
-            how.flags = O_RDONLY | O_DIRECT | O_CLOEXEC;
-            how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
-            file.fd = syscall(SYS_openat2, root_fd, relative.c_str(), &how, sizeof(how));
-            if (file.fd < 0) throw std::runtime_error("Cannot open local SSD range");
-        }
-        struct stat st {};
-        if (fstat(file.fd, &st) || !S_ISREG(st.st_mode) ||
-            static_cast<uint64_t>(st.st_dev) != range.device ||
-            static_cast<uint64_t>(st.st_ino) != range.inode ||
-            static_cast<uint64_t>(st.st_size) != range.file_size ||
-            st.st_mtim.tv_sec != range.mtime_sec || st.st_mtim.tv_nsec != range.mtime_nsec)
-            throw std::runtime_error("Local SSD file identity changed");
+        auto found = lane.files.find(range.path);
+        // A cached descriptor of a since-replaced bucket file is reopened.
+        if (found != lane.files.end() && !SameFile(found->second->fd, range))
+            lane.files.erase(found), found = lane.files.end();
+        if (found != lane.files.end()) return *found->second;
+        if (lane.files.size() >= kMaxOpenFiles) lane.files.clear();
+        auto file = std::make_unique<FileHandle>();
+        struct open_how how {};
+        how.flags = O_RDONLY | O_DIRECT | O_CLOEXEC;
+        how.resolve = RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS;
+        file->fd = syscall(SYS_openat2, root_fd, relative.c_str(), &how, sizeof(how));
+        if (file->fd < 0) throw std::runtime_error("Cannot open local SSD range");
+        if (!SameFile(file->fd, range)) throw std::runtime_error("Local SSD file identity changed");
         CUfileDescr_t descriptor {};
         descriptor.type = CU_FILE_HANDLE_TYPE_OPAQUE_FD;
-        descriptor.handle.fd = file.fd;
-        if (!file.handle) CheckCuFile(cuFileHandleRegister(&file.handle, &descriptor));
+        descriptor.handle.fd = file->fd;
+        CheckCuFile(cuFileHandleRegister(&file->handle, &descriptor));
+        return *(lane.files[range.path] = std::move(file));
+    }
+
+    void ReadFile(Lane& lane, const LocalFileRead& range, uintptr_t destination, size_t size) {
+        if (range.path.empty() || range.size != size || !size ||
+            range.offset > range.file_size || size > range.file_size - range.offset)
+            throw std::runtime_error("Invalid or missing local SSD range");
+        FileHandle& file = Open(lane, range);
         uint64_t copied = 0;
         while (copied < size) {
             uint64_t begin = (range.offset + copied) & ~uint64_t(4095);
@@ -123,7 +158,7 @@ struct GDSReader::Impl {
                 (begin + skip + payload + 4095) & ~uint64_t(4095));
             size_t bytes = end - begin;
             auto start = std::chrono::steady_clock::now();
-            ssize_t result = cuFileRead(file.handle, scratch, bytes, begin, 0);
+            ssize_t result = cuFileRead(file.handle, lane.scratch, bytes, begin, 0);
             const auto finish = std::chrono::steady_clock::now();
             const auto finish_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(finish.time_since_epoch()).count();
             io_metric.Record(StorageIOKind::SSD_READ, result > 0 ? static_cast<uint64_t>(result) : 0, 1, 0, finish_ns);
@@ -133,8 +168,8 @@ struct GDSReader::Impl {
             if (result != static_cast<ssize_t>(bytes))
                 throw std::runtime_error("cuFile SSD read failed or returned a short read");
             CheckCUDA(cudaMemcpyAsync(reinterpret_cast<void*>(destination + copied),
-                static_cast<char*>(scratch) + skip, payload, cudaMemcpyDeviceToDevice, stream));
-            CheckCUDA(cudaStreamSynchronize(stream));
+                static_cast<char*>(lane.scratch) + skip, payload, cudaMemcpyDeviceToDevice, lane.stream));
+            CheckCUDA(cudaStreamSynchronize(lane.stream));
             copied += payload;
         }
         Add("ssd_payload_bytes", size);
@@ -142,14 +177,14 @@ struct GDSReader::Impl {
 #endif
 };
 
-GDSReader::GDSReader(const std::string& root, int device, size_t max_io_bytes)
+GDSReader::GDSReader(const std::string& root, int device, size_t max_io_bytes, int workers)
     : impl_(std::make_unique<Impl>()) {
 #ifndef STORE_USE_GDS
     throw std::runtime_error("GDS (compat) requires a STORE_USE_GDS build");
 #else
     auto& p = *impl_;
     if (device < 0 || max_io_bytes < 4096 || max_io_bytes % 4096 ||
-        max_io_bytes > (256ULL << 20))
+        max_io_bytes > (256ULL << 20) || workers < 1 || workers > 64)
         throw std::invalid_argument("Invalid GDS device or buffer size");
     p.root = std::filesystem::canonical(root);
     p.root_fd = ::open(p.root.c_str(), O_PATH | O_DIRECTORY | O_CLOEXEC);
@@ -166,11 +201,16 @@ GDSReader::GDSReader(const std::string& root, int device, size_t max_io_bytes)
         ++driver_users;
         p.driver_open = true;
     }
-    CheckCUDA(cudaStreamCreateWithFlags(&p.stream, cudaStreamNonBlocking));
-    CheckCUDA(cudaMalloc(&p.scratch, max_io_bytes));
-    CheckCuFile(cuFileBufRegister(p.scratch, max_io_bytes, 0));
-    p.registered = true;
-    p.stats["gpu_staging_bytes"] = max_io_bytes;
+    for (int i = 0; i < workers; ++i) {
+        auto& lane = *p.lanes.emplace_back(std::make_unique<Lane>());
+        CheckCUDA(cudaStreamCreateWithFlags(&lane.stream, cudaStreamNonBlocking));
+        CheckCUDA(cudaMalloc(&lane.scratch, max_io_bytes));
+        CheckCuFile(cuFileBufRegister(lane.scratch, max_io_bytes, 0));
+        lane.registered = true;
+        p.idle.push_back(&lane);
+    }
+    p.stats["gpu_staging_bytes"] = max_io_bytes * workers;
+    p.stats["workers"] = workers;
 #endif
 }
 
@@ -181,21 +221,19 @@ std::map<std::string, uint64_t> GDSReader::Stats() const {
     return impl_->stats;
 }
 
+// Reads record at completion time, so a window counts the reads that finish in it.
 bool GDSReader::BeginIOWindow(uint64_t window_id, int64_t start_ns) {
-    std::unique_lock lock(impl_->mutex, std::try_to_lock);
-    return lock.owns_lock() && impl_->io_metric.BeginWindow(window_id, start_ns, true);
+    return impl_->io_metric.BeginWindow(window_id, start_ns, true);
 }
 
 bool GDSReader::EndIOWindow(uint64_t window_id, int64_t end_ns, bool abort) {
-    if (abort) return impl_->io_metric.EndWindow(window_id, end_ns, true);
-    std::unique_lock lock(impl_->mutex, std::try_to_lock);
-    return lock.owns_lock() && impl_->io_metric.EndWindow(window_id, end_ns, false);
+    return impl_->io_metric.EndWindow(window_id, end_ns, abort);
 }
 
 std::string GDSReader::IOWindow() const {
     auto output = impl_->io_metric.SnapshotJson();
 #ifdef STORE_USE_GDS
-    const bool available = impl_->driver_open && impl_->registered;
+    const bool available = impl_->driver_open && !impl_->lanes.empty();
 #else
     const bool available = false;
 #endif
@@ -209,12 +247,12 @@ int64_t GDSReader::IOClockNs() { return StorageIOMetric::MonotonicNs(); }
 
 std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
     const std::vector<std::string>& keys,
-    const std::vector<uintptr_t>& destinations, const std::vector<size_t>& sizes) {
+    const std::vector<uintptr_t>& destinations, const std::vector<size_t>& sizes,
+    bool skip_memory) {
 #ifndef STORE_USE_GDS
     throw std::runtime_error("GDS (compat) requires a STORE_USE_GDS build");
 #else
     auto& p = *impl_;
-    std::lock_guard lock(p.mutex);
     if (!store || !store->client_ || !store->client_requester_ ||
         keys.size() != sizes.size() || keys.size() != destinations.size() ||
         keys.size() > 4096 ||
@@ -228,6 +266,12 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             throw std::invalid_argument("GDS requires device buffers on its configured GPU");
     }
     std::vector<int> results(keys.size(), 0);
+    Lane* lane = p.Acquire();
+    struct LaneGuard {
+        Impl& p;
+        Lane* lane;
+        ~LaneGuard() { p.Release(lane); }
+    } lane_guard{p, lane};
     auto queries = store->client_->BatchQuery(keys);
     // FLAT_MEMORY: v0.3.13 offload RPCs address tenant-scoped storage keys.
     const TenantId tenant_id(store->client_->tenant_id());
@@ -247,7 +291,8 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             if (!endpoint.starts_with("127.0.0.1:"))
                 throw std::runtime_error("GDS (compat) supports only a local SSD owner");
             disks[endpoint].push_back(i);
-        } else {
+        } else if (!skip_memory) {
+            // skip_memory leaves memory replicas to the caller's host-staged read.
             auto memory = std::find_if(queries[i]->replicas.begin(), queries[i]->replicas.end(),
                 [](const auto& candidate) { return candidate.is_memory_replica(); });
             if (memory == queries[i]->replicas.end()) continue;
@@ -271,13 +316,12 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             size_t i = memory_indices[j];
             if (!loaded[j]) continue;
             CheckCUDA(cudaMemcpyAsync(reinterpret_cast<void*>(destinations[i]),
-                                  handles[j].ptr(), sizes[i], cudaMemcpyHostToDevice, p.stream));
-            CheckCUDA(cudaStreamSynchronize(p.stream));
+                                  handles[j].ptr(), sizes[i], cudaMemcpyHostToDevice, lane->stream));
+            CheckCUDA(cudaStreamSynchronize(lane->stream));
             p.Add("dram_payload_bytes", sizes[i]);
             results[i] = 1;
         }
     }
-    std::unordered_map<std::string, std::unique_ptr<FileHandle>> files;
     for (const auto& [endpoint, indices] : disks) {
         std::vector<std::string> disk_keys;
         std::vector<int64_t> disk_sizes;
@@ -296,7 +340,7 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
             for (size_t j = 0; j < indices.size(); ++j) {
                 size_t i = indices[j];
                 try {
-                    p.ReadFile(batch->files[j], destinations[i], sizes[i], files);
+                    p.ReadFile(*lane, batch->files[j], destinations[i], sizes[i]);
                     results[i] = 2;
                 } catch (const std::exception& error) {
                     p.Add("read_errors", 1);
@@ -308,7 +352,7 @@ std::vector<int> GDSReader::Read(const std::shared_ptr<PyClient>& store,
         }
         store->client_requester_->release_offload_buffer(endpoint, batch->batch_id);
     }
-    CheckCUDA(cudaStreamSynchronize(p.stream));
+    CheckCUDA(cudaStreamSynchronize(lane->stream));
     return results;
 #endif
 }
